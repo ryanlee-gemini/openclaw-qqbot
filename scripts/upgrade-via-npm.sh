@@ -40,7 +40,9 @@ set -eo pipefail
 # 当脚本由 openclaw gateway 子进程 fork 执行时，属于 gateway 的进程组。
 # gateway restart 发送 SIGTERM 会连带杀死本脚本。
 # 用 setsid 创建新的会话和进程组，使本脚本不受 gateway 信号影响。
-if [ -z "$_UPGRADE_ISOLATED" ] && command -v setsid &>/dev/null; then
+# 注意：curl | bash 模式下 $0 为 "bash" 而非脚本文件路径，此时跳过 exec setsid，
+# 否则会启动一个空 bash 会话导致脚本内容丢失。
+if [ -z "$_UPGRADE_ISOLATED" ] && [ -f "$0" ] && command -v setsid &>/dev/null; then
     export _UPGRADE_ISOLATED=1
     exec setsid "$0" "$@"
 fi
