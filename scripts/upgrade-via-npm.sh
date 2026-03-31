@@ -1,1424 +1,728 @@
 #!/bin/bash
 
-# qqbot 通过 openclaw 原生插件指令升级（v2 — 针对 openclaw 子进程执行场景优化）
+# qqbot 通过 openclaw 原生插件指令升级（v3）
 #
-# 使用 openclaw plugins install/update 原生命令进行安装和升级，
-# 保留 appid/secret 配置写入、热更新 (--no-restart)、结构化输出等功能。
-#
-# v2 优化要点（解决 openclaw 子进程执行失败率高的问题）：
-#   1. 进程隔离：用 setsid 脱离 gateway 进程组，避免被父进程 SIGTERM 连带杀死
-#   2. 升级锁：写入 .upgrading 锁文件，防止 config file watcher 竞态重启
-#   3. 原子化操作：先在临时暂存目录完成安装，最后一步 mv 替换，减少中间状态
-#   4. CWD 加固：在每个子命令执行前确保 CWD 有效
-#   5. 延迟配置回写：确保插件目录完全就绪后才同步回真实配置
-#   6. 环境归一化：主动修复 PATH、npm registry 等环境差异
-#   7. 超时保护：为 npm 下载/安装操作设置超时，超时后自动回滚
-#   8. 配置快照：安装前对配置文件做完整快照，任何异常都能恢复到安装前状态
-#   9. npm pack 降级：openclaw ≥ 3.22 时，原生指令失败后降级为 npm pack + 手动安装
-#  10. spec 解锁：update 前检测 plugins.installs 中的 spec 是否被 pin 到具体版本，
-#      如果是则修正为 @latest，避免 update 只能下载到当前版本导致无效操作
-#  11. 已是最新版检测：update 成功但版本未变时，先查询 npm latest 版本，
-#      如果当前版本就是 latest 则直接标记成功，避免无意义的 reinstall 重复下载
-#
-# 升级策略：
-#   1. 已安装（plugins.installs 有记录）→ openclaw plugins update
-#   2. 未安装 / update 失败 → 删除旧目录 + openclaw plugins install
+# 策略：
+#   安装场景（插件不存在）：openclaw plugins install → 失败降级 npm pack 手动部署
+#   更新场景（插件已存在）：openclaw plugins update  → 失败降级 npm pack 手动部署
 #
 # 用法:
-#   upgrade-via-npm.sh                                    # 升级到 latest（默认）
+#   upgrade-via-npm.sh                                    # 升级到 latest
 #   upgrade-via-npm.sh --version <version>                # 升级到指定版本
 #   upgrade-via-npm.sh --self-version                     # 升级到当前仓库 package.json 版本
 #   upgrade-via-npm.sh --appid <appid> --secret <secret>  # 首次安装时配置 appid/secret
-#   upgrade-via-npm.sh --no-restart                       # 只做文件替换，不重启 gateway（供热更指令使用）
-#   upgrade-via-npm.sh --timeout 600                       # 自定义安装超时时间（秒，默认300）
+#   upgrade-via-npm.sh --no-restart                       # 只做文件替换，不重启 gateway
+#   upgrade-via-npm.sh --timeout 600                      # 自定义安装超时时间（秒）
 
 set -eo pipefail
 
 # ============================================================================
-#  [优化1] 进程隔离 — 脱离 gateway 进程组
+#  进程隔离 — 脱离 gateway 进程组
 # ============================================================================
-# 当脚本由 openclaw gateway 子进程 fork 执行时，属于 gateway 的进程组。
-# gateway restart 发送 SIGTERM 会连带杀死本脚本。
-# 用 setsid 创建新的会话和进程组，使本脚本不受 gateway 信号影响。
-# 注意：curl | bash 模式下 $0 为 "bash" 而非脚本文件路径，此时跳过 exec setsid，
-# 否则会启动一个空 bash 会话导致脚本内容丢失。
 if [ -z "$_UPGRADE_ISOLATED" ] && [ -f "$0" ] && command -v setsid &>/dev/null; then
     export _UPGRADE_ISOLATED=1
     exec setsid "$0" "$@"
 fi
 
 # ============================================================================
-#  [优化4] CWD 加固 — 确保 CWD 始终有效
+#  环境准备
 # ============================================================================
-# ⚠️ 必须在 cd 之前解析脚本路径，否则相对路径的 $0 在 cd 后无法正确解析
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 PROJECT_DIR=""
 [ -n "$SCRIPT_DIR" ] && PROJECT_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)" || true
 
-# 确保 cwd 是一个存在的目录。
-# 当从 gateway 进程 fork 时，继承的 cwd 可能已被删除（如旧插件目录被 mv/rm），
-# 导致 openclaw CLI 启动时 process.cwd() 报 ENOENT: uv_cwd 错误。
 cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
 
-# 辅助函数：在执行子命令前确保 CWD 有效（防止中途被删除）
 ensure_valid_cwd() {
-    # 尝试 stat 当前目录，如果失败说明 CWD 已被删除
-    if ! stat . &>/dev/null 2>&1; then
-        cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
-    fi
+    stat . &>/dev/null 2>&1 || cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
 }
 
-# ============================================================================
-#  [优化6] 环境归一化 — 修复 PATH 和 npm 配置差异
-# ============================================================================
-# openclaw 子进程可能继承受限的 PATH，缺少 /usr/local/bin 等常用路径
-for _extra_path in /usr/local/bin /usr/local/sbin /usr/bin /usr/sbin /bin /sbin; do
-    case ":$PATH:" in
-        *":$_extra_path:"*) ;;  # 已存在
-        *) [ -d "$_extra_path" ] && export PATH="$PATH:$_extra_path" ;;
-    esac
+read_pkg_version() {
+    node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$1','utf8')).version||'')}catch{}" 2>/dev/null || true
+}
+
+for _p in /usr/local/bin /usr/local/sbin /usr/bin /usr/sbin /bin /sbin; do
+    case ":$PATH:" in *":$_p:"*) ;; *) [ -d "$_p" ] && export PATH="$PATH:$_p" ;; esac
 done
-
-# 确保 npm registry 可用（通过环境变量设置，不修改用户的 .npmrc）
-if [ -z "$npm_config_registry" ]; then
-    export npm_config_registry="https://registry.npmjs.org"
-fi
+[ -z "$npm_config_registry" ] && export npm_config_registry="https://registry.npmjs.org"
 
 # ============================================================================
-#  版本比较辅助函数
+#  超时执行包装器（兼容 macOS 无 GNU timeout）
 # ============================================================================
-# 比较两个语义化版本号，返回 0 表示 $1 >= $2
-# 用法: version_gte "2026.3.22" "2026.3.22" → 返回 0 (true)
-version_gte() {
-    local v1="$1" v2="$2"
-    # 拆分为数组
-    local IFS='.'
-    read -ra v1_parts <<< "$v1"
-    read -ra v2_parts <<< "$v2"
-    # 逐段比较（最多比较 3 段）
-    local i
-    for i in 0 1 2; do
-        local a="${v1_parts[$i]:-0}"
-        local b="${v2_parts[$i]:-0}"
-        if [ "$a" -gt "$b" ] 2>/dev/null; then return 0; fi
-        if [ "$a" -lt "$b" ] 2>/dev/null; then return 1; fi
-    done
-    return 0  # 相等也算 >=
-}
-
-# ============================================================================
-#  [优化9] npm pack 降级安装
-# ============================================================================
-# 当 openclaw plugins install 失败且 openclaw 版本 ≥ 3.22 时，
-# 参考飞书的做法，降级为 npm pack + 手动解压 + 直接部署到 extensions 目录。
-# 这种方式绕过了 openclaw CLI 的 plugins install 逻辑，直接操作文件系统。
-#
-# 流程：
-#   1. npm pack <pkg> 下载 tgz（多 registry 兜底）
-#   2. tar xzf 解压到临时目录
-#   3. 检查 bundled dependencies，缺失则 npm install --omit=dev
-#   4. 移动到 extensions 目录
-#   5. 手动写入 plugins.installs 和 plugins.entries 配置
-#   6. 执行 postinstall-link-sdk.js 创建 SDK symlink
-#
-# 用法: npm_pack_fallback_install
-# 返回值: 0=成功, 1=失败
-npm_pack_fallback_install() {
-    echo ""
-    echo "  ============================================"
-    echo "  [降级] 尝试 npm pack + 手动安装（绕过 openclaw CLI）"
-    echo "  ============================================"
-
-    # 检查 npm 和 tar 是否可用
-    if ! command -v npm &>/dev/null; then
-        echo "  ❌ [降级] npm 命令不可用，无法执行降级安装"
-        return 1
-    fi
-    if ! command -v tar &>/dev/null; then
-        echo "  ❌ [降级] tar 命令不可用，无法解压 tgz"
-        return 1
-    fi
-
-    local pack_dir=""
-    local extract_dir=""
-    pack_dir="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-pack-XXXXXX")"
-    extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-extract-XXXXXX")"
-
-    # 确保退出时清理临时目录
-    _cleanup_pack_dirs() {
-        [ -n "$pack_dir" ] && [ -d "$pack_dir" ] && rm -rf "$pack_dir" 2>/dev/null || true
-        [ -n "$extract_dir" ] && [ -d "$extract_dir" ] && rm -rf "$extract_dir" 2>/dev/null || true
-    }
-
-    # ── Step 1: npm pack 下载 tgz（多 registry 兜底）──
-    echo "  [降级 1/5] 下载 npm 包: $INSTALL_SRC"
-    local pack_ok=false
-    local registries=("https://registry.npmjs.org/" "https://registry.npmmirror.com/" "")
-    ensure_valid_cwd
-
-    for registry in "${registries[@]}"; do
-        local pack_args=("pack" "$INSTALL_SRC" "--pack-destination" "$pack_dir")
-        if [ -n "$registry" ]; then
-            pack_args+=("--registry" "$registry")
-            echo "    尝试 registry: $registry"
-        else
-            echo "    尝试默认 registry..."
-        fi
-
-        if run_with_timeout "$INSTALL_TIMEOUT" "npm pack $INSTALL_SRC" npm "${pack_args[@]}" 2>&1; then
-            pack_ok=true
-            break
-        fi
-    done
-
-    if [ "$pack_ok" != "true" ]; then
-        echo "  ❌ [降级] npm pack 失败（所有 registry 均不可用）"
-        _cleanup_pack_dirs
-        return 1
-    fi
-
-    # 找到下载的 tgz 文件
-    local tgz_file=""
-    tgz_file="$(find "$pack_dir" -maxdepth 1 -name '*.tgz' -type f | head -1)"
-    if [ -z "$tgz_file" ] || [ ! -f "$tgz_file" ]; then
-        echo "  ❌ [降级] 未找到下载的 tgz 文件"
-        _cleanup_pack_dirs
-        return 1
-    fi
-    echo "    已下载: $(basename "$tgz_file")"
-
-    # ── Step 2: 解压 tgz ──
-    echo "  [降级 2/5] 解压 tgz..."
-    if ! tar xzf "$tgz_file" -C "$extract_dir" 2>&1; then
-        echo "  ❌ [降级] 解压失败"
-        _cleanup_pack_dirs
-        return 1
-    fi
-
-    # npm pack 解压后的目录名为 "package"
-    local package_dir="$extract_dir/package"
-    if [ ! -d "$package_dir" ] || [ ! -f "$package_dir/package.json" ]; then
-        echo "  ❌ [降级] 解压后未找到 package 目录或 package.json"
-        _cleanup_pack_dirs
-        return 1
-    fi
-
-    # ── Step 3: 检查 bundled dependencies ──
-    echo "  [降级 3/5] 检查 bundled dependencies..."
-    local nm_dir="$package_dir/node_modules"
-    if [ -d "$nm_dir" ]; then
-        local bundled_count
-        bundled_count="$(find "$nm_dir" -maxdepth 2 -name 'package.json' -type f 2>/dev/null | wc -l | tr -d ' ')"
-        echo "    bundled dependencies 就绪（${bundled_count} 个包）"
-    else
-        echo "    ⚠️  bundled node_modules 不存在，执行 npm install..."
-        ensure_valid_cwd
-        (
-            cd "$package_dir" 2>/dev/null || true
-            npm install --omit=dev --omit=peer --ignore-scripts --quiet 2>&1 || true
-        )
-    fi
-
-    # ── Step 4: 部署到 extensions 目录 ──
-    echo "  [降级 4/5] 部署到 extensions 目录..."
-    local target_dir="$EXTENSIONS_DIR/$PLUGIN_ID"
-
-    # 确保 extensions 目录存在
-    mkdir -p "$EXTENSIONS_DIR" 2>/dev/null || true
-
-    # 如果目标目录已存在（可能是之前失败留下的不完整目录），先清理
-    if [ -d "$target_dir" ]; then
-        rm -rf "$target_dir" 2>/dev/null || true
-    fi
-
-    # 移动到目标位置
-    if ! mv "$package_dir" "$target_dir" 2>&1; then
-        echo "  ❌ [降级] 移动到 extensions 目录失败"
-        _cleanup_pack_dirs
-        return 1
-    fi
-
-    # 验证部署结果
-    if [ ! -d "$target_dir" ] || [ ! -f "$target_dir/package.json" ]; then
-        echo "  ❌ [降级] 部署后目录不完整"
-        _cleanup_pack_dirs
-        return 1
-    fi
-
-    # ── Step 5: 写入配置 + 执行 postinstall ──
-    echo "  [降级 5/5] 写入配置并创建 SDK symlink..."
-
-    # 手动写入 plugins.installs 和 plugins.entries 到配置文件
-    # （因为没有通过 openclaw plugins install，配置不会自动更新）
-    local _npm_pack_ver=""
-    _npm_pack_ver="$(node -e "
-      try {
-        const v = JSON.parse(require('fs').readFileSync('$target_dir/package.json', 'utf8')).version;
-        if (v) process.stdout.write(String(v));
-      } catch {}
-    " 2>/dev/null || true)"
-
-    # 写入配置（直接操作真实配置文件，因为此时临时配置已不再使用）
-    local _config_to_update="$CONFIG_FILE"
-    # 如果有临时配置文件且 OPENCLAW_CONFIG_PATH 已设置，先写入临时配置
-    if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-        _config_to_update="$TEMP_CONFIG_FILE"
-    fi
-
-    if [ -f "$_config_to_update" ]; then
-        node -e "
-          try {
-            const fs = require('fs');
-            const cfg = JSON.parse(fs.readFileSync('$_config_to_update', 'utf8'));
-            if (!cfg.plugins) cfg.plugins = {};
-            // 写入 installs 记录
-            if (!cfg.plugins.installs) cfg.plugins.installs = {};
-            cfg.plugins.installs['$PLUGIN_ID'] = {
-              source: 'npm',
-              spec: '$INSTALL_SRC',
-              version: '$_npm_pack_ver'
-            };
-            // 写入 entries 记录
-            if (!cfg.plugins.entries) cfg.plugins.entries = {};
-            if (!cfg.plugins.entries['$PLUGIN_ID']) {
-              cfg.plugins.entries['$PLUGIN_ID'] = { enabled: true };
-            }
-            // 确保 allow 列表包含插件
-            if (!cfg.plugins.allow) cfg.plugins.allow = [];
-            if (!cfg.plugins.allow.includes('$PLUGIN_ID')) {
-              cfg.plugins.allow.push('$PLUGIN_ID');
-            }
-            fs.writeFileSync('$_config_to_update', JSON.stringify(cfg, null, 4) + '\n');
-          } catch(e) { console.error('  ⚠️  写入配置失败:', e.message); }
-        " 2>/dev/null || true
-        echo "    已写入 plugins.installs/entries/allow 配置"
-    fi
-
-    # 执行 postinstall-link-sdk.js 创建 openclaw SDK symlink
-    local postinstall_script="$target_dir/scripts/postinstall-link-sdk.js"
-    if [ -f "$postinstall_script" ]; then
-        echo "    执行 postinstall-link-sdk..."
-        ensure_valid_cwd
-        if node "$postinstall_script" 2>&1; then
-            echo "    ✅ plugin-sdk 链接就绪"
-        else
-            echo "    ⚠️  postinstall-link-sdk 失败（非致命）"
-        fi
-    fi
-
-    # 清理临时目录
-    _cleanup_pack_dirs
-
-    echo "  ✅ [降级] npm pack + 手动安装成功 (v${_npm_pack_ver:-unknown})"
-    return 0
-}
-
-# ============================================================================
-#  [优化7] 超时执行包装器
-# ============================================================================
-# 为 npm 下载/安装操作提供超时保护。
-# 容器内网络不稳定或 npm registry 响应慢时，防止脚本无限挂起。
-# 超时后自动终止子进程，触发回滚流程。
-#
-# 用法: run_with_timeout <超时秒数> <描述> <命令...>
-# 返回值: 0=成功, 124=超时, 其他=命令本身的退出码
 run_with_timeout() {
-    local timeout_secs="$1"
-    local description="$2"
-    shift 2
+    local timeout_secs="$1" description="$2"; shift 2
 
-    # 优先使用系统 timeout 命令（GNU coreutils）
     if command -v timeout &>/dev/null; then
-        echo "  [超时保护] ${description}: 最长等待 ${timeout_secs}s"
-        # --kill-after=10: 如果 SIGTERM 后 10 秒进程仍未退出，发送 SIGKILL
-        if timeout --kill-after=10 "$timeout_secs" "$@"; then
-            return 0
-        else
-            local rc=$?
-            if [ $rc -eq 124 ]; then
-                echo "  ⏰ [超时] ${description} 超过 ${timeout_secs}s，已终止"
-            fi
-            return $rc
-        fi
+        echo "  [超时保护] ${description}: 最长 ${timeout_secs}s"
+        timeout --kill-after=10 "$timeout_secs" "$@" && return 0
+        local rc=$?
+        [ $rc -eq 124 ] && echo "  ⏰ ${description} 超时"
+        return $rc
     fi
 
-    # fallback: 没有 timeout 命令时，用后台进程 + sleep 实现
-    echo "  [超时保护] ${description}: 最长等待 ${timeout_secs}s (fallback 模式)"
+    # macOS fallback
+    echo "  [超时保护] ${description}: 最长 ${timeout_secs}s"
     "$@" &
     local cmd_pid=$!
-
-    # 启动看门狗进程
-    (
-        sleep "$timeout_secs" 2>/dev/null
-        # 检查命令是否还在运行
-        if kill -0 "$cmd_pid" 2>/dev/null; then
-            echo "  ⏰ [超时] ${description} 超过 ${timeout_secs}s，正在终止 (PID: $cmd_pid)..."
-            kill -TERM "$cmd_pid" 2>/dev/null
-            sleep 5
-            # 如果还没退出，强制杀死
-            kill -0 "$cmd_pid" 2>/dev/null && kill -KILL "$cmd_pid" 2>/dev/null
-        fi
+    ( sleep "$timeout_secs" 2>/dev/null
+      kill -0 "$cmd_pid" 2>/dev/null && echo "  ⏰ ${description} 超时，终止中..." && \
+          kill -TERM "$cmd_pid" 2>/dev/null && sleep 5 && \
+          kill -0 "$cmd_pid" 2>/dev/null && kill -KILL "$cmd_pid" 2>/dev/null
     ) &
-    local watchdog_pid=$!
-
-    # 等待命令完成
-    wait "$cmd_pid" 2>/dev/null
-    local rc=$?
-
-    # 清理看门狗
-    kill "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null 2>&1
-
-    # 判断是否是被信号杀死（128+signal）
-    if [ $rc -eq 143 ] || [ $rc -eq 137 ]; then
-        # 143=SIGTERM(15), 137=SIGKILL(9) → 视为超时
-        return 124
-    fi
+    local wd=$!; disown "$wd" 2>/dev/null || true
+    wait "$cmd_pid" 2>/dev/null; local rc=$?
+    kill "$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null 2>&1 || true
+    [ $rc -eq 143 ] || [ $rc -eq 137 ] && return 124
     return $rc
 }
 
 # ============================================================================
-#  [优化8] 配置快照 — 安装前对配置文件做完整快照
+#  配置快照 / 回滚
 # ============================================================================
-# 在任何修改操作之前，对真实配置文件做完整备份。
-# 无论是超时、信号中断、安装失败还是其他异常，都能恢复到安装前的配置状态。
+CONFIG_SNAPSHOT_FILE=""
+
 snapshot_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        CONFIG_SNAPSHOT_FILE="$(mktemp "${TMPDIR:-/tmp}/.qqbot-config-snapshot-XXXXXX")"
-        cp -a "$CONFIG_FILE" "$CONFIG_SNAPSHOT_FILE"
-        echo "  [快照] 已保存配置快照: $CONFIG_SNAPSHOT_FILE"
-    fi
+    [ -f "$CONFIG_FILE" ] || return 0
+    CONFIG_SNAPSHOT_FILE="$(mktemp "${TMPDIR:-/tmp}/.qqbot-config-snapshot-XXXXXX")"
+    cp -a "$CONFIG_FILE" "$CONFIG_SNAPSHOT_FILE"
+    echo "  [快照] 已保存配置快照"
 }
 
-# 回滚配置到快照状态
 restore_config_snapshot() {
-    if [ -n "$CONFIG_SNAPSHOT_FILE" ] && [ -f "$CONFIG_SNAPSHOT_FILE" ]; then
-        if [ -n "$CONFIG_FILE" ]; then
-            cp -a "$CONFIG_SNAPSHOT_FILE" "$CONFIG_FILE"
-            echo "  ↩️  [快照] 已恢复配置到安装前状态"
-        fi
-    fi
+    [ -n "$CONFIG_SNAPSHOT_FILE" ] && [ -f "$CONFIG_SNAPSHOT_FILE" ] && [ -n "$CONFIG_FILE" ] && \
+        cp -a "$CONFIG_SNAPSHOT_FILE" "$CONFIG_FILE" && echo "  ↩️  已恢复配置到安装前状态"
+    return 0
 }
 
-# 清理配置快照
 cleanup_config_snapshot() {
-    if [ -n "$CONFIG_SNAPSHOT_FILE" ] && [ -f "$CONFIG_SNAPSHOT_FILE" ]; then
-        rm -f "$CONFIG_SNAPSHOT_FILE" 2>/dev/null || true
-    fi
+    [ -n "$CONFIG_SNAPSHOT_FILE" ] && rm -f "$CONFIG_SNAPSHOT_FILE" 2>/dev/null || true
 }
 
-# 回滚插件目录并验证完整性
-# 返回值: 0=回滚成功且验证通过, 1=回滚失败或无备份
 rollback_plugin_dir() {
     local reason="${1:-未知原因}"
-    if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
+    if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR/$PLUGIN_ID" ]; then
         rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID" 2>/dev/null || true
-        if [ -d "$BACKUP_DIR/$PLUGIN_ID" ]; then
-            mv "$BACKUP_DIR/$PLUGIN_ID" "$EXTENSIONS_DIR/$PLUGIN_ID"
-        else
-            mv "$BACKUP_DIR" "$EXTENSIONS_DIR/$PLUGIN_ID"
-        fi
-
-        # 验证回滚后的目录完整性
-        if [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
-            local rollback_ver
-            rollback_ver="$(node -e "
-              try {
-                const v = JSON.parse(require('fs').readFileSync('$EXTENSIONS_DIR/$PLUGIN_ID/package.json', 'utf8')).version;
-                if (v) process.stdout.write(String(v));
-              } catch {}
-            " 2>/dev/null || true)"
-            echo "  ↩️  已回滚到旧版本 v${rollback_ver:-unknown}（原因: ${reason}）"
-            echo "  ✅ [回滚验证] 插件目录完整，package.json 存在"
-            return 0
-        else
-            echo "  ❌ [回滚验证] 回滚后插件目录仍不完整！"
-            return 1
-        fi
-    else
-        echo "  ⚠️  无备份可回滚（原因: ${reason}）"
-        return 1
+        mv "$BACKUP_DIR/$PLUGIN_ID" "$EXTENSIONS_DIR/$PLUGIN_ID" 2>/dev/null || \
+            cp -a "$BACKUP_DIR/$PLUGIN_ID" "$EXTENSIONS_DIR/$PLUGIN_ID" 2>/dev/null || true
+        [ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ] && \
+            echo "  ↩️  已回滚到旧版本 v$(read_pkg_version "$EXTENSIONS_DIR/$PLUGIN_ID/package.json")（原因: ${reason}）" && return 0
+        echo "  ❌ 回滚后插件目录仍不完整！"; return 1
     fi
+    echo "  ⚠️  无备份可回滚（原因: ${reason}）"; return 1
 }
 
 # ============================================================================
-#  [优化2] 升级锁机制
+#  升级锁
 # ============================================================================
-UPGRADE_LOCK_FILE=""  # 在检测到 CMD 后设置
+UPGRADE_LOCK_FILE=""
 
 acquire_upgrade_lock() {
-    if [ -n "$UPGRADE_LOCK_FILE" ]; then
-        # 检查是否有其他升级进程在运行
-        if [ -f "$UPGRADE_LOCK_FILE" ]; then
-            local lock_pid
-            lock_pid="$(cat "$UPGRADE_LOCK_FILE" 2>/dev/null || true)"
-            if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
-                echo "❌ 另一个升级进程正在运行 (PID: $lock_pid)，请稍后重试"
-                exit 1
-            fi
-            # 锁文件存在但进程已死，清理残留锁
-            echo "  ⚠️  清理残留锁文件（旧进程 PID: ${lock_pid:-unknown} 已不存在）"
-            rm -f "$UPGRADE_LOCK_FILE" 2>/dev/null || true
+    [ -z "$UPGRADE_LOCK_FILE" ] && return 0
+    if [ -f "$UPGRADE_LOCK_FILE" ]; then
+        local lock_pid="$(cat "$UPGRADE_LOCK_FILE" 2>/dev/null || true)"
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            echo "❌ 另一个升级进程正在运行 (PID: $lock_pid)"; exit 1
         fi
-        echo "$$" > "$UPGRADE_LOCK_FILE"
-        echo "  [锁] 已获取升级锁 (PID: $$)"
+        rm -f "$UPGRADE_LOCK_FILE" 2>/dev/null || true
     fi
+    echo "$$" > "$UPGRADE_LOCK_FILE"
 }
 
 release_upgrade_lock() {
-    if [ -n "$UPGRADE_LOCK_FILE" ] && [ -f "$UPGRADE_LOCK_FILE" ]; then
-        rm -f "$UPGRADE_LOCK_FILE" 2>/dev/null || true
-        echo "  [锁] 已释放升级锁"
-    fi
+    [ -n "$UPGRADE_LOCK_FILE" ] && rm -f "$UPGRADE_LOCK_FILE" 2>/dev/null || true
 }
 
 # ============================================================================
-#  异常退出清理（增强版）
+#  临时配置副本（绕过 openclaw 3.23+ 配置校验）
 # ============================================================================
-INSTALL_COMPLETED=false  # 标记 install 是否已完成（用于区分正常退出和异常退出）
+setup_temp_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local need_temp
+    need_temp="$(node -e "
+      try {
+        const fs = require('fs');
+        const cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
+        if (cfg.channels?.qqbot || cfg.plugins?.allow?.includes('$PLUGIN_ID') || cfg.plugins?.entries?.['$PLUGIN_ID'])
+          process.stdout.write('1');
+      } catch {}
+    " 2>/dev/null || true)"
+    [ "$need_temp" != "1" ] && return 0
+
+    TEMP_CONFIG_FILE="$(mktemp)"
+    if node -e "
+      const fs = require('fs');
+      const cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
+      delete cfg.channels?.qqbot;
+      cfg.channels && Object.keys(cfg.channels).length === 0 && delete cfg.channels;
+      if (Array.isArray(cfg.plugins?.allow)) {
+        cfg.plugins.allow = cfg.plugins.allow.filter(p => p !== '$PLUGIN_ID');
+        cfg.plugins.allow.length === 0 && delete cfg.plugins.allow;
+      }
+      delete cfg.plugins?.entries?.['$PLUGIN_ID'];
+      cfg.plugins?.entries && Object.keys(cfg.plugins.entries).length === 0 && delete cfg.plugins.entries;
+      fs.writeFileSync('$TEMP_CONFIG_FILE', JSON.stringify(cfg, null, 4) + '\n');
+    " 2>/dev/null; then
+        echo "  [兼容] 创建临时配置副本以通过 3.23+ 配置校验"
+        export OPENCLAW_CONFIG_PATH="$TEMP_CONFIG_FILE"
+    else
+        echo "  ⚠️  创建临时配置失败，继续使用原配置"
+        rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true; TEMP_CONFIG_FILE=""
+    fi
+}
+
+sync_temp_config() {
+    [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ] || return 0
+    if [ ! -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
+        echo "  ⚠️  插件目录不完整，跳过配置同步"
+        rm -f "$TEMP_CONFIG_FILE"; unset OPENCLAW_CONFIG_PATH; return 1
+    fi
+    ensure_valid_cwd
+    node -e "
+      const fs = require('fs');
+      const tmp = JSON.parse(fs.readFileSync('$TEMP_CONFIG_FILE', 'utf8'));
+      const real = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
+      let c = false;
+      if (tmp.plugins?.installs) { (real.plugins ??= {}).installs = { ...real.plugins.installs, ...tmp.plugins.installs }; c = true; }
+      if (tmp.plugins?.entries) { (real.plugins ??= {}).entries = { ...real.plugins.entries, ...tmp.plugins.entries }; c = true; }
+      for (const id of tmp.plugins?.allow || []) {
+        if (!(real.plugins ??= {}).allow) real.plugins.allow = [];
+        if (!real.plugins.allow.includes(id)) { real.plugins.allow.push(id); c = true; }
+      }
+      if (c) fs.writeFileSync('$CONFIG_FILE', JSON.stringify(real, null, 4) + '\n');
+    " 2>/dev/null || true
+    rm -f "$TEMP_CONFIG_FILE"; unset OPENCLAW_CONFIG_PATH
+    echo "  [兼容] 已同步配置并清理临时副本"
+}
+
+# ============================================================================
+#  npm pack 降级安装（内联实现）
+# ============================================================================
+npm_pack_fallback() {
+    echo ""
+    echo "  ============================================"
+    echo "  [降级] 尝试 npm pack + 手动安装"
+    echo "  ============================================"
+
+    # 前置检查
+    for _cmd in npm tar node; do
+        if ! command -v "$_cmd" &>/dev/null; then
+            echo "  ❌ $_cmd 不可用，无法执行降级安装"; return 1
+        fi
+    done
+
+    local pack_dir extract_dir
+    pack_dir="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-pack-XXXXXX")"
+    extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-extract-XXXXXX")"
+
+    _cleanup_pack() {
+        [ -n "$pack_dir" ] && rm -rf "$pack_dir" 2>/dev/null || true
+        [ -n "$extract_dir" ] && rm -rf "$extract_dir" 2>/dev/null || true
+    }
+
+    # Step 1: npm pack（多 registry 兜底）
+    echo "  [降级 1/4] 下载: $INSTALL_SRC"
+    local pack_ok=false
+    ensure_valid_cwd
+    for registry in "https://registry.npmjs.org/" "https://mirrors.cloud.tencent.com/npm/"; do
+        echo "    尝试 registry: $registry"
+        if run_with_timeout "$INSTALL_TIMEOUT" "npm pack" npm pack "$INSTALL_SRC" \
+                --pack-destination "$pack_dir" --registry "$registry" 2>&1; then
+            pack_ok=true; break
+        fi
+    done
+    if [ "$pack_ok" != "true" ]; then
+        echo "  ❌ npm pack 失败（所有 registry 均不可用）"; _cleanup_pack; return 1
+    fi
+
+    local tgz_file
+    tgz_file="$(find "$pack_dir" -maxdepth 1 -name '*.tgz' -type f | head -1)"
+    if [ -z "$tgz_file" ]; then
+        echo "  ❌ 未找到 tgz 文件"; _cleanup_pack; return 1
+    fi
+    echo "    已下载: $(basename "$tgz_file")"
+
+    # Step 2: 解压
+    echo "  [降级 2/4] 解压..."
+    if ! tar xzf "$tgz_file" -C "$extract_dir" 2>&1; then
+        echo "  ❌ 解压失败"; _cleanup_pack; return 1
+    fi
+    local package_dir="$extract_dir/package"
+    if [ ! -f "$package_dir/package.json" ]; then
+        echo "  ❌ 解压后未找到 package.json"; _cleanup_pack; return 1
+    fi
+
+    # Step 3: 检查 bundled dependencies
+    echo "  [降级 3/4] 检查依赖..."
+    local nm_dir="$package_dir/node_modules"
+    if [ ! -d "$nm_dir" ] || [ ! -d "$nm_dir/ws" ]; then
+        echo "    执行 npm install --omit=dev..."
+        ensure_valid_cwd
+        ( cd "$package_dir" && npm install --omit=dev --omit=peer --ignore-scripts --quiet 2>&1 ) || true
+        if [ ! -d "$nm_dir/ws" ]; then
+            echo "  ❌ 关键依赖 ws 缺失"; _cleanup_pack; return 1
+        fi
+    fi
+    echo "    ✅ 依赖就绪"
+
+    # Step 4: 部署到 extensions
+    echo "  [降级 4/4] 部署..."
+    local target_dir="$EXTENSIONS_DIR/$PLUGIN_ID"
+    mkdir -p "$EXTENSIONS_DIR" 2>/dev/null || true
+
+    # 备份旧目录（如果 BACKUP_DIR 尚未设置）
+    if [ -z "$BACKUP_DIR" ] && [ -d "$target_dir" ]; then
+        BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-upgrade-backup-XXXXXX")"
+        cp -a "$target_dir" "$BACKUP_DIR/$PLUGIN_ID"
+    fi
+    rm -rf "$target_dir" 2>/dev/null || true
+
+    if ! mv "$package_dir" "$target_dir" 2>&1; then
+        echo "  ❌ 部署失败"; _cleanup_pack; return 1
+    fi
+    if [ ! -f "$target_dir/package.json" ]; then
+        echo "  ❌ 部署后目录不完整"; _cleanup_pack; return 1
+    fi
+
+    # 写入配置
+    local _ver; _ver="$(read_pkg_version "$target_dir/package.json")"
+    local _cfg_target="${TEMP_CONFIG_FILE:-$CONFIG_FILE}"
+    if [ -f "$_cfg_target" ]; then
+        node -e "
+          try {
+            const fs = require('fs');
+            const cfg = JSON.parse(fs.readFileSync('$_cfg_target', 'utf8'));
+            if (!cfg.plugins) cfg.plugins = {};
+            (cfg.plugins.installs ??= {})['$PLUGIN_ID'] = { source: 'npm', spec: '$INSTALL_SRC', version: '$_ver' };
+            (cfg.plugins.entries ??= {})['$PLUGIN_ID'] ??= { enabled: true };
+            if (!cfg.plugins.allow) cfg.plugins.allow = [];
+            if (!cfg.plugins.allow.includes('$PLUGIN_ID')) cfg.plugins.allow.push('$PLUGIN_ID');
+            fs.writeFileSync('$_cfg_target', JSON.stringify(cfg, null, 4) + '\n');
+          } catch {}
+        " 2>/dev/null || true
+        echo "    ✅ 已写入配置"
+    fi
+
+    # postinstall SDK link
+    if [ -f "$target_dir/scripts/postinstall-link-sdk.js" ]; then
+        ensure_valid_cwd
+        node "$target_dir/scripts/postinstall-link-sdk.js" 2>&1 && echo "    ✅ SDK 链接就绪" || \
+            echo "    ⚠️  postinstall-link-sdk 失败（非致命）"
+    fi
+
+    _cleanup_pack
+    echo "  ✅ npm pack 安装成功 (v${_ver:-unknown})"
+    return 0
+}
+
+# ============================================================================
+#  异常退出清理
+# ============================================================================
+INSTALL_COMPLETED=false
+BACKUP_DIR=""
+TEMP_CONFIG_FILE=""
+
 cleanup_on_exit() {
     local exit_code=$?
-
-    # [优化4] 确保 CWD 有效，否则 cleanup 中的命令也会失败
     ensure_valid_cwd
 
-    # 判断退出原因
-    local exit_reason="未知"
-    case $exit_code in
-        124) exit_reason="安装超时" ;;
-        130) exit_reason="用户中断 (SIGINT)" ;;
-        143) exit_reason="收到 SIGTERM" ;;
-        129) exit_reason="收到 SIGHUP" ;;
-        137) exit_reason="被 SIGKILL 强制终止" ;;
-        0)   exit_reason="正常退出" ;;
-        *)   exit_reason="异常退出 (code=$exit_code)" ;;
-    esac
-
     if [ "$INSTALL_COMPLETED" != "true" ] && [ $exit_code -ne 0 ]; then
-        echo "  ⚠️  [cleanup] 退出原因: ${exit_reason}"
-    fi
-
-    # 异常退出且 install 未完成时：恢复配置快照 + 回滚插件目录
-    if [ "$INSTALL_COMPLETED" != "true" ] && [ $exit_code -ne 0 ]; then
-        # [优化8] 恢复配置快照（优先于部分同步，确保配置完全回到安装前状态）
+        local reason="异常退出 (code=$exit_code)"
+        case $exit_code in 124) reason="安装超时";; 130) reason="用户中断";; 143) reason="SIGTERM";; 129) reason="SIGHUP";; esac
+        echo "  ⚠️  [cleanup] ${reason}"
         restore_config_snapshot
-
-        # 清理临时配置文件（不再需要同步，因为已恢复快照）
-        if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-            rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
-        fi
-
-        # 回滚插件目录
-        if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-            if [ ! -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] || [ ! -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
-                rollback_plugin_dir "$exit_reason"
-            else
-                # 插件目录看起来完整，但 install 未标记完成 → 可能是验证阶段失败
-                # 仍然回滚，因为不确定新版本是否可用
-                echo "  ⚠️  [cleanup] 插件目录存在但安装未完成，保险起见回滚"
-                rollback_plugin_dir "$exit_reason (安装未完成)"
-            fi
-        fi
-    elif [ "$INSTALL_COMPLETED" != "true" ] && [ $exit_code -eq 0 ]; then
-        # 正常退出但 install 未完成（如 --help），清理临时文件
-        if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-            rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
-        fi
-        if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-            rm -rf "$BACKUP_DIR" 2>/dev/null || true
-        fi
-    else
-        # install 已完成，正常清理
-        if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-            rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
-        fi
-        if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-            rm -rf "$BACKUP_DIR" 2>/dev/null || true
-        fi
+        rollback_plugin_dir "$reason"
     fi
 
-    # 清理暂存目录（原子化操作的临时目录）
-    if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
-        rm -rf "$STAGING_DIR" 2>/dev/null || true
-    fi
-
-    # 清理 openclaw install 可能残留的暂存目录（extensions 和 /tmp 中都可能存在）
-    find "${EXTENSIONS_DIR:-/dev/null}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-
-    # [优化9] 清理 npm pack 降级安装可能残留的临时目录
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-pack-*" -exec rm -rf {} + 2>/dev/null || true
-    find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-extract-*" -exec rm -rf {} + 2>/dev/null || true
-
-    # [优化8] 清理配置快照
+    [ -n "$TEMP_CONFIG_FILE" ] && rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
+    [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR" 2>/dev/null || true
     cleanup_config_snapshot
-
-    # [优化2] 释放升级锁
+    find "${EXTENSIONS_DIR:-/dev/null}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
+    find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name ".openclaw-install-stage-*" -o -name ".qqbot-pack-*" \
+        -o -name ".qqbot-extract-*" -o -name ".qqbot-upgrade-backup-*" \) -exec rm -rf {} + 2>/dev/null || true
     release_upgrade_lock
-
     exit $exit_code
 }
 trap cleanup_on_exit EXIT
+trap 'echo "  ⚠️  收到 SIGTERM"; exit 143' TERM
+trap 'echo "  ⚠️  收到 SIGINT"; exit 130' INT
+trap 'echo "  ⚠️  收到 SIGHUP"; exit 129' HUP
 
-# 增强信号处理：捕获 SIGTERM/SIGINT/SIGHUP，确保 cleanup 能执行
-trap 'echo "  ⚠️  收到 SIGTERM 信号，正在清理..."; exit 143' TERM
-trap 'echo "  ⚠️  收到 SIGINT 信号，正在清理..."; exit 130' INT
-trap 'echo "  ⚠️  收到 SIGHUP 信号，正在清理..."; exit 129' HUP
+# 清理上次升级遗留（>60min）
+find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name ".qqbot-upgrade-backup-*" -o -name ".qqbot-pack-*" \
+    -o -name ".qqbot-extract-*" \) -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 
-# 清理上次升级可能遗留的备份目录（如上次脚本被 kill 等极端情况）
-find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-upgrade-backup-*" -exec rm -rf {} + 2>/dev/null || true
-find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-pack-*" -exec rm -rf {} + 2>/dev/null || true
-find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-extract-*" -exec rm -rf {} + 2>/dev/null || true
-
+# ============================================================================
+#  参数解析
+# ============================================================================
 PKG_NAME="@tencent-connect/openclaw-qqbot"
 PLUGIN_ID="openclaw-qqbot"
-INSTALL_SRC=""
 TARGET_VERSION=""
 APPID=""
 SECRET=""
 NO_RESTART=false
-INSTALL_TIMEOUT=1000  # [优化7] 安装超时时间（秒），默认 1000s
-STAGING_DIR=""  # [优化3] 原子化操作的暂存目录
-CONFIG_SNAPSHOT_FILE=""  # [优化8] 配置文件快照路径
-
-LOCAL_VERSION="$(node -e "
-  try {
-    const fs = require('fs');
-    const path = require('path');
-    const p = path.join('$PROJECT_DIR', 'package.json');
-    const v = JSON.parse(fs.readFileSync(p, 'utf8')).version;
-    if (v) process.stdout.write(String(v));
-  } catch {}
-" 2>/dev/null || true)"
+INSTALL_TIMEOUT=1000
+LOCAL_VERSION="$(read_pkg_version "$PROJECT_DIR/package.json")"
 
 print_usage() {
-    echo "用法:"
-    echo "  upgrade-via-npm.sh                              # 升级到 latest（默认）"
-    echo "  upgrade-via-npm.sh --version <版本号>            # 升级到指定版本"
-    if [ -n "$LOCAL_VERSION" ]; then
-        echo "  upgrade-via-npm.sh --self-version               # 升级到当前仓库版本（$LOCAL_VERSION）"
-    else
-        echo "  upgrade-via-npm.sh --self-version               # 升级到当前仓库版本"
-    fi
-    echo ""
-    echo "  --pkg <scope/name>    指定 npm 包名（如 ryantest/openclaw-qqbot）"
-    echo "  --appid <appid>       QQ机器人 appid（首次安装时必填）"
-    echo "  --secret <secret>     QQ机器人 secret（首次安装时必填）"
-    echo ""
-    echo "也可以通过环境变量设置:"
-    echo "  QQBOT_APPID           QQ机器人 appid"
-    echo "  QQBOT_SECRET          QQ机器人 secret"
-    echo "  QQBOT_TOKEN           QQ机器人 token (appid:secret)"
+    cat <<EOF
+用法:
+  upgrade-via-npm.sh                              # 升级到 latest
+  upgrade-via-npm.sh --version <版本号>            # 升级到指定版本
+  upgrade-via-npm.sh --self-version               # 升级到当前仓库版本${LOCAL_VERSION:+ ($LOCAL_VERSION)}
+
+  --pkg <scope/name>    指定 npm 包名
+  --appid <appid>       QQ机器人 appid
+  --secret <secret>     QQ机器人 secret
+  --no-restart          只做文件替换，不重启 gateway
+  --timeout <秒>        自定义安装超时（默认1000）
+
+环境变量: QQBOT_APPID / QQBOT_SECRET / QQBOT_TOKEN (appid:secret)
+EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)
-            [ -z "$2" ] && echo "❌ --tag 需要参数" && exit 1
-            TARGET_VERSION="${2#v}"  # 去掉 v 前缀（npm 版本号不带 v）
-            shift 2
-            ;;
-        --version)
-            [ -z "$2" ] && echo "❌ --version 需要参数" && exit 1
-            TARGET_VERSION="${2#v}"  # 去掉 v 前缀（npm 版本号不带 v）
-            shift 2
-            ;;
-        --self-version)
-            [ -z "$LOCAL_VERSION" ] && echo "❌ 无法从 package.json 读取版本" && exit 1
-            TARGET_VERSION="$LOCAL_VERSION"
-            shift 1
-            ;;
-        --appid)
-            [ -z "$2" ] && echo "❌ --appid 需要参数" && exit 1
-            APPID="$2"
-            shift 2
-            ;;
-        --secret)
-            [ -z "$2" ] && echo "❌ --secret 需要参数" && exit 1
-            SECRET="$2"
-            shift 2
-            ;;
-        --pkg)
-            [ -z "$2" ] && echo "❌ --pkg 需要参数" && exit 1
-            _pkg="$2"
-            # 支持 "scope/name" 自动补 @
-            if [[ "$_pkg" != @* ]]; then _pkg="@$_pkg"; fi
-            PKG_NAME="$_pkg"
-            shift 2
-            ;;
-        --no-restart)
-            NO_RESTART=true
-            shift 1
-            ;;
-        --timeout)
-            [ -z "$2" ] && echo "❌ --timeout 需要参数" && exit 1
-            INSTALL_TIMEOUT="$2"
-            shift 2
-            ;;
-        -h|--help)
-            print_usage
-            exit 0
-            ;;
+        --tag|--version) [ -z "$2" ] && echo "❌ $1 需要参数" && exit 1; TARGET_VERSION="${2#v}"; shift 2 ;;
+        --self-version) [ -z "$LOCAL_VERSION" ] && echo "❌ 无法读取版本" && exit 1; TARGET_VERSION="$LOCAL_VERSION"; shift ;;
+        --appid) [ -z "$2" ] && echo "❌ --appid 需要参数" && exit 1; APPID="$2"; shift 2 ;;
+        --secret) [ -z "$2" ] && echo "❌ --secret 需要参数" && exit 1; Secret="$2"; shift 2 ;;
+        --pkg) [ -z "$2" ] && echo "❌ --pkg 需要参数" && exit 1; _p="$2"; [[ "$_p" != @* ]] && _p="@$_p"; PKG_NAME="$_p"; shift 2 ;;
+        --no-restart) NO_RESTART=true; shift ;;
+        --timeout) [ -z "$2" ] && echo "❌ --timeout 需要参数" && exit 1; INSTALL_TIMEOUT="$2"; shift 2 ;;
+        -h|--help) print_usage; exit 0 ;;
         *) echo "未知选项: $1"; print_usage; exit 1 ;;
     esac
 done
-# 参数解析完毕后统一拼接 INSTALL_SRC（确保 --pkg 无论在 --version 前后都能生效）
-if [ -n "$TARGET_VERSION" ]; then
-    INSTALL_SRC="${PKG_NAME}@${TARGET_VERSION}"
-else
-    INSTALL_SRC="${PKG_NAME}@latest"
-fi
+
+INSTALL_SRC="${PKG_NAME}@${TARGET_VERSION:-latest}"
 
 # 环境变量 fallback
-APPID="${APPID:-$QQBOT_APPID}"
-SECRET="${SECRET:-$QQBOT_SECRET}"
+APPID="${APPID:-$QQBOT_APPID}"; SECRET="${SECRET:-$QQBOT_SECRET}"
 if [ -z "$APPID" ] && [ -z "$SECRET" ] && [ -n "$QQBOT_TOKEN" ]; then
-    APPID="${QQBOT_TOKEN%%:*}"
-    SECRET="${QQBOT_TOKEN#*:}"
+    APPID="${QQBOT_TOKEN%%:*}"; SECRET="${QQBOT_TOKEN#*:}"
 fi
 
-# 检测 CLI
-CMD=""
-for name in openclaw clawdbot moltbot; do
-    command -v "$name" &>/dev/null && CMD="$name" && break
-done
-[ -z "$CMD" ] && echo "❌ 未找到 openclaw / clawdbot / moltbot" && exit 1
+# 检测 openclaw
+command -v openclaw &>/dev/null || { echo "❌ 未找到 openclaw"; exit 1; }
 
-EXTENSIONS_DIR="$HOME/.$CMD/extensions"
+# 解析数据目录（支持 OPENCLAW_STATE_DIR 覆盖）
+OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+EXTENSIONS_DIR="$OPENCLAW_HOME/extensions"
+CONFIG_FILE="$OPENCLAW_HOME/openclaw.json"
 
-# [优化2] 设置升级锁文件路径并获取锁
-UPGRADE_LOCK_FILE="$HOME/.$CMD/.upgrading"
+UPGRADE_LOCK_FILE="$OPENCLAW_HOME/.upgrading"
 acquire_upgrade_lock
 
-# 检测 openclaw 版本
-OPENCLAW_VERSION="$($CMD --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+OPENCLAW_VERSION="$(openclaw --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
 
 echo "==========================================="
 echo "  qqbot 升级: $INSTALL_SRC"
-echo "  openclaw 版本: ${OPENCLAW_VERSION:-unknown}"
-echo "  进程隔离: ${_UPGRADE_ISOLATED:+✓ setsid}${_UPGRADE_ISOLATED:-✗ 未隔离}"
-echo "  安装超时: ${INSTALL_TIMEOUT}s"
+echo "  openclaw: v${OPENCLAW_VERSION:-unknown}"
+echo "  隔离: ${_UPGRADE_ISOLATED:+✓ setsid}${_UPGRADE_ISOLATED:-✗}  超时: ${INSTALL_TIMEOUT}s"
 echo "==========================================="
-echo ""
 
-# 记录升级前的版本
+# 记录旧版本
 OLD_VERSION=""
 OLD_PKG="$EXTENSIONS_DIR/$PLUGIN_ID/package.json"
-if [ -f "$OLD_PKG" ]; then
-    OLD_VERSION="$(node -e "
-      try {
-        const v = JSON.parse(require('fs').readFileSync('$OLD_PKG', 'utf8')).version;
-        if (v) process.stdout.write(String(v));
-      } catch {}
-    " 2>/dev/null || true)"
-    echo "  当前版本: ${OLD_VERSION:-unknown}"
-fi
+[ -f "$OLD_PKG" ] && OLD_VERSION="$(read_pkg_version "$OLD_PKG")"
+[ -n "$OLD_VERSION" ] && echo "  当前版本: $OLD_VERSION"
 
-# [1/4] 通过 openclaw 原生指令安装/升级
+# ============================================================================
+#  [1/4] 安装/升级插件
+# ============================================================================
 echo ""
 echo "[1/4] 安装/升级插件..."
-
-# ── 兼容 openclaw 3.23+ 配置严格校验 ──
-# 3.23+ 在 plugins install/update 时会校验整个配置文件，
-# 如果 channels.qqbot 已存在但 qqbot 插件尚未加载，校验会失败。
-#
-# ⚠️ 关键：绝不能直接修改真实的 openclaw.json，否则 gateway 的 config file watcher
-#    会检测到变更并触发 SIGUSR1 重启，导致正在执行的升级脚本被杀死。
-#
-# 解决：创建临时配置副本（不含 channels.qqbot），通过 OPENCLAW_CONFIG_PATH
-#       环境变量让 plugins install/update 使用临时配置，真实配置文件不受影响。
-CONFIG_FILE="$HOME/.$CMD/$CMD.json"
-TEMP_CONFIG_FILE=""
-NEEDS_TEMP_CONFIG=false
-
-# [优化8] 在任何修改操作之前，保存配置快照
 snapshot_config
-
-if [ -f "$CONFIG_FILE" ]; then
-    NEEDS_TEMP_CONFIG="$(node -e "
-      try {
-        const fs = require('fs');
-        const cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
-        const hasChannel = !!(cfg.channels && cfg.channels.qqbot);
-        const hasAllow = Array.isArray(cfg.plugins?.allow) && cfg.plugins.allow.includes('$PLUGIN_ID');
-        const hasEntry = !!(cfg.plugins?.entries?.['$PLUGIN_ID']);
-        if (hasChannel || hasAllow || hasEntry) process.stdout.write('true');
-      } catch {}
-    " 2>/dev/null || true)"
-
-    if [ "$NEEDS_TEMP_CONFIG" = "true" ]; then
-        TEMP_CONFIG_FILE="$(mktemp)"
-        node -e "
-          try {
-            const fs = require('fs');
-            const cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
-            // 移除 channels.qqbot（插件自定义通道，校验时会 unknown channel id）
-            if (cfg.channels?.qqbot) {
-              delete cfg.channels.qqbot;
-              if (Object.keys(cfg.channels).length === 0) delete cfg.channels;
-            }
-            // 移除 plugins.allow 中的 openclaw-qqbot（插件目录被备份后校验找不到）
-            if (Array.isArray(cfg.plugins?.allow)) {
-              cfg.plugins.allow = cfg.plugins.allow.filter(p => p !== '$PLUGIN_ID');
-              if (cfg.plugins.allow.length === 0) delete cfg.plugins.allow;
-            }
-            // 移除 plugins.entries 中的 openclaw-qqbot（同理）
-            if (cfg.plugins?.entries?.['$PLUGIN_ID']) {
-              delete cfg.plugins.entries['$PLUGIN_ID'];
-              if (Object.keys(cfg.plugins.entries).length === 0) delete cfg.plugins.entries;
-            }
-            fs.writeFileSync('$TEMP_CONFIG_FILE', JSON.stringify(cfg, null, 4) + '\n');
-          } catch(e) { process.exit(1); }
-        " 2>/dev/null
-        if [ $? -eq 0 ]; then
-            echo "  [兼容] 创建临时配置副本（不含 channels.qqbot / plugins.allow / plugins.entries）以通过配置校验"
-            export OPENCLAW_CONFIG_PATH="$TEMP_CONFIG_FILE"
-        else
-            echo "  ⚠️  创建临时配置失败，继续使用原配置"
-            TEMP_CONFIG_FILE=""
-        fi
-    fi
-fi
-
-# ============================================================================
-#  [优化5] 延迟配置回写 — 确保插件目录完全就绪后才同步回真实配置
-# ============================================================================
-# plugins install/update 可能把 install 记录写入了临时配置，需要同步回真实配置。
-# 关键改进：在同步前先验证插件目录完整性，避免写入不一致的状态。
-restore_qqbot_channel() {
-    if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-        # [优化5] 先验证插件目录是否完整，再决定是否同步
-        if [ ! -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] || [ ! -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
-            echo "  ⚠️  [延迟回写] 插件目录不完整，跳过配置同步（避免写入不一致状态）"
-            rm -f "$TEMP_CONFIG_FILE"
-            unset OPENCLAW_CONFIG_PATH
-            return 1
-        fi
-
-        # [优化4] 确保 CWD 有效
-        ensure_valid_cwd
-
-        # 将临时配置中 plugins.installs 和 plugins.entries 的变更同步回真实配置
-        node -e "
-          try {
-            const fs = require('fs');
-            const tmp = JSON.parse(fs.readFileSync('$TEMP_CONFIG_FILE', 'utf8'));
-            const real = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
-            let changed = false;
-            if (tmp.plugins && tmp.plugins.installs) {
-              if (!real.plugins) real.plugins = {};
-              real.plugins.installs = { ...(real.plugins.installs || {}), ...tmp.plugins.installs };
-              changed = true;
-            }
-            // 同步 plugins.entries（openclaw plugins install 会写入 entries）
-            if (tmp.plugins && tmp.plugins.entries) {
-              if (!real.plugins) real.plugins = {};
-              real.plugins.entries = { ...(real.plugins.entries || {}), ...tmp.plugins.entries };
-              changed = true;
-            }
-            // 同步 plugins.allow（npm pack 降级安装时会写入 allow）
-            if (Array.isArray(tmp.plugins?.allow) && tmp.plugins.allow.length > 0) {
-              if (!real.plugins) real.plugins = {};
-              if (!Array.isArray(real.plugins.allow)) real.plugins.allow = [];
-              for (const id of tmp.plugins.allow) {
-                if (!real.plugins.allow.includes(id)) {
-                  real.plugins.allow.push(id);
-                }
-              }
-              changed = true;
-            }
-            if (changed) {
-              fs.writeFileSync('$CONFIG_FILE', JSON.stringify(real, null, 4) + '\n');
-            }
-          } catch {}
-        " 2>/dev/null || true
-        rm -f "$TEMP_CONFIG_FILE"
-        unset OPENCLAW_CONFIG_PATH
-        echo "  [兼容] 已同步 install/entries 记录并清理临时配置副本"
-    fi
-}
+setup_temp_config
 
 UPGRADE_OK=false
 
-# 检测安装状态：同时检查配置记录和磁盘目录，并读取 spec 字段
-# 输出格式: "yes|<spec>" 或 "" (无记录)
+# 检测安装状态
 INSTALL_RECORD_INFO="$(node -e "
   try {
-    const fs = require('fs');
-    const p = '$HOME/.$CMD/$CMD.json';
-    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    const inst = cfg.plugins && cfg.plugins.installs && cfg.plugins.installs['$PLUGIN_ID'];
-    if (inst) {
-      const spec = inst.spec || '';
-      process.stdout.write('yes|' + spec);
-    }
+    const cfg = JSON.parse(require('fs').readFileSync('$CONFIG_FILE', 'utf8'));
+    const inst = cfg.plugins?.installs?.['$PLUGIN_ID'];
+    if (inst) process.stdout.write('yes|' + (inst.spec || ''));
   } catch {}
 " 2>/dev/null || true)"
 HAS_INSTALL_RECORD="${INSTALL_RECORD_INFO%%|*}"
 INSTALL_SPEC="${INSTALL_RECORD_INFO#*|}"
 HAS_PLUGIN_DIR=false
-[ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ] && HAS_PLUGIN_DIR=true
+[ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ -f "$OLD_PKG" ] && HAS_PLUGIN_DIR=true
 
-# 决策矩阵：
-#   配置有记录 + 目录存在 → update（最佳路径）
-#   配置有记录 + 目录不存在 → 清理残留记录，走 install
-#   配置无记录 + 目录存在 → 删目录，走 install（配置与文件不一致）
-#   配置无记录 + 目录不存在 → 走 install（全新安装）
-#
-# 指定了具体版本（--version/--tag/--self-version）时：
-#   update 不支持指定版本，直接走 删除 + install
-
+# 决策：配置有记录 + 目录存在 + 未指定版本 → update，其他 → install
 USE_UPDATE=false
-
 if [ "$HAS_INSTALL_RECORD" = "yes" ] && [ "$HAS_PLUGIN_DIR" = "true" ] && [ -z "$TARGET_VERSION" ]; then
-    # 配置和目录都齐全，且未指定版本 → 走 update
     USE_UPDATE=true
-    # [优化10] 检测 spec 是否被 pin 到具体版本号
-    # openclaw CLI 在 install 后会将 spec 从 @latest 改写为 @具体版本号（如 @1.6.3），
-    # 导致后续 update 只能"更新"到同一版本。这里提前检测并修正。
-    SPEC_IS_PINNED=false
+    echo "  [检测] 配置 ✓ | 目录 ✓ | 未指定版本 → update"
+    # spec 解锁
     if [ -n "$INSTALL_SPEC" ]; then
-        # 判断 spec 是否包含具体版本号（如 @tencent-connect/openclaw-qqbot@1.6.3）
-        # 而非 tag（如 @latest, @next, @beta）
-        # 具体版本号的特征：@ 后面跟数字开头的语义化版本
         SPEC_SUFFIX="${INSTALL_SPEC##*@}"
         if echo "$SPEC_SUFFIX" | grep -qE '^[0-9]+\.[0-9]+'; then
-            SPEC_IS_PINNED=true
+            echo "  [spec 解锁] '$INSTALL_SPEC' → @latest"
+            node -e "
+              try {
+                const fs = require('fs'), p = process.env.OPENCLAW_CONFIG_PATH || '$CONFIG_FILE';
+                const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+                if (cfg.plugins?.installs?.['$PLUGIN_ID']) {
+                  cfg.plugins.installs['$PLUGIN_ID'].spec = '$PKG_NAME@latest';
+                  fs.writeFileSync(p, JSON.stringify(cfg, null, 4) + '\n');
+                }
+              } catch {}
+            " 2>/dev/null || true
         fi
     fi
-    if [ "$SPEC_IS_PINNED" = "true" ]; then
-        echo "  [检测] 配置记录 ✓ | 插件目录 ✓ | 未指定版本 → 使用 update"
-        echo "  [优化10] spec 被 pin 为 '$INSTALL_SPEC'，update 前修正为 @latest"
-        # 将 plugins.installs 中的 spec 修正为 @latest，使 update 能拉取最新版本
-        node -e "
-          try {
-            const fs = require('fs');
-            const configPath = process.env.OPENCLAW_CONFIG_PATH || '$HOME/.$CMD/$CMD.json';
-            const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            if (cfg.plugins && cfg.plugins.installs && cfg.plugins.installs['$PLUGIN_ID']) {
-              const oldSpec = cfg.plugins.installs['$PLUGIN_ID'].spec;
-              cfg.plugins.installs['$PLUGIN_ID'].spec = '$PKG_NAME@latest';
-              fs.writeFileSync(configPath, JSON.stringify(cfg, null, 4) + '\n');
-              process.stdout.write('ok');
-            }
-          } catch(e) { process.stderr.write(e.message); }
-        " 2>/dev/null && echo "  [优化10] ✓ spec 已修正为 '$PKG_NAME@latest'" || echo "  [优化10] ⚠️ spec 修正失败，update 可能仍使用旧版本"
-    else
-        echo "  [检测] 配置记录 ✓ | 插件目录 ✓ | 未指定版本 → 使用 update"
-    fi
-elif [ "$HAS_INSTALL_RECORD" = "yes" ] && [ "$HAS_PLUGIN_DIR" = "true" ]; then
-    echo "  [检测] 配置记录 ✓ | 插件目录 ✓ | 指定版本 $TARGET_VERSION → 使用 reinstall"
-elif [ "$HAS_INSTALL_RECORD" = "yes" ]; then
-    echo "  [检测] 配置记录 ✓ | 插件目录 ✗ → 配置与文件不一致，使用 install"
 elif [ "$HAS_PLUGIN_DIR" = "true" ]; then
-    echo "  [检测] 配置记录 ✗ | 插件目录 ✓ → 目录残留，清理后 install"
+    echo "  [检测] 目录 ✓ | 指定版本或无配置记录 → reinstall"
 else
-    echo "  [检测] 配置记录 ✗ | 插件目录 ✗ → 全新安装"
+    echo "  [检测] 目录 ✗ → 全新安装"
 fi
 
+mark_success() {
+    UPGRADE_OK=true; INSTALL_COMPLETED=true
+    [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR" 2>/dev/null && BACKUP_DIR="" || true
+}
+
+# ── 更新路径 ──
 if [ "$USE_UPDATE" = "true" ]; then
-    echo "  尝试 update..."
-    # [优化4] 确保 CWD 有效
+    echo "  尝试 openclaw plugins update..."
     ensure_valid_cwd
-    # [优化7] 带超时保护执行 update
-    if run_with_timeout "$INSTALL_TIMEOUT" "plugins update" $CMD plugins update "$PLUGIN_ID" 2>&1; then
-        # update 返回 0 不一定真的更新了，检查版本是否变化
-        POST_UPDATE_VERSION=""
-        if [ -f "$OLD_PKG" ]; then
-            POST_UPDATE_VERSION="$(node -e "
-              try {
-                const v = JSON.parse(require('fs').readFileSync('$OLD_PKG', 'utf8')).version;
-                if (v) process.stdout.write(String(v));
-              } catch {}
-            " 2>/dev/null || true)"
-        fi
-        if [ -n "$POST_UPDATE_VERSION" ] && [ "$POST_UPDATE_VERSION" != "$OLD_VERSION" ]; then
-            UPGRADE_OK=true
-            echo "  ✅ update 成功 ($OLD_VERSION → $POST_UPDATE_VERSION)"
+    UPDATE_RC=0
+    run_with_timeout "$INSTALL_TIMEOUT" "plugins update" openclaw plugins update "$PLUGIN_ID" 2>&1 || UPDATE_RC=$?
+
+    if [ $UPDATE_RC -eq 0 ]; then
+        POST_VER=""; [ -f "$OLD_PKG" ] && POST_VER="$(read_pkg_version "$OLD_PKG")"
+        if [ -n "$POST_VER" ] && [ "$POST_VER" != "$OLD_VERSION" ]; then
+            mark_success; echo "  ✅ update 成功 ($OLD_VERSION → $POST_VER)"
         elif [ -z "$OLD_VERSION" ]; then
-            # 之前没有旧版本，无法比较，信任 update 结果
-            UPGRADE_OK=true
-            echo "  ✅ update 成功"
+            mark_success; echo "  ✅ update 成功"
         else
-            # [优化11] update 返回成功但版本未变 → 先查询 npm latest 版本，
-            # 如果当前版本就是 latest，说明已是最新，无需 reinstall
-            echo "  ℹ️  update 返回成功但版本未变 ($POST_UPDATE_VERSION)，检查是否已是最新版..."
-            NPM_LATEST_VERSION=""
-            NPM_LATEST_VERSION="$(npm view "$PKG_NAME" version 2>/dev/null || true)"
-            if [ -n "$NPM_LATEST_VERSION" ] && [ "$NPM_LATEST_VERSION" = "$POST_UPDATE_VERSION" ]; then
-                UPGRADE_OK=true
-                echo "  ✅ 当前版本 $POST_UPDATE_VERSION 已是 npm 最新版本，无需升级"
+            echo "  ℹ️  版本未变 ($POST_VER)，查询 npm latest..."
+            NPM_LATEST="$(npm view "$PKG_NAME" version 2>/dev/null || true)"
+            if [ -n "$NPM_LATEST" ] && [ "$NPM_LATEST" = "$POST_VER" ]; then
+                mark_success; echo "  ✅ 已是最新版本 $POST_VER"
             else
-                echo "  ️  npm latest=${NPM_LATEST_VERSION:-unknown}，当前=${POST_UPDATE_VERSION}，回退到 reinstall..."
+                echo "  ⚠️  npm latest=${NPM_LATEST:-unknown}，当前=$POST_VER，降级..."
             fi
         fi
     else
-        update_rc=$?
-        if [ $update_rc -eq 124 ]; then
-            echo "  ⏰ update 超时（${INSTALL_TIMEOUT}s），回退到 reinstall..."
-        else
-            echo "  ️  update 失败 (exit=$update_rc)，回退到 reinstall..."
-        fi
+        [ $UPDATE_RC -eq 124 ] && echo "  ⏰ update 超时" || echo "  ⚠️  update 失败 (exit=$UPDATE_RC)"
     fi
+
+    [ "$UPGRADE_OK" != "true" ] && npm_pack_fallback && mark_success
 fi
 
+# ── 安装路径 ──
 if [ "$UPGRADE_OK" != "true" ]; then
-    # ============================================================================
-    #  [优化3] 原子化操作 — 先在暂存目录完成安装，最后一步 mv 替换
-    # ============================================================================
-    # 传统方式：先 mv 旧目录到备份 → install 到原位 → 失败则回滚
-    #   问题：install 过程中插件目录处于"空缺"状态，如果 gateway 此时重启会报错
-    #
-    # 原子化方式：旧目录保持不动 → install 到暂存目录 → 验证暂存目录完整 → mv 替换
-    #   优势：插件目录始终处于"有效"状态，中间状态暴露时间极短（仅 mv 操作的瞬间）
-
-    # 备份旧目录（用于回滚）
-    BACKUP_DIR=""
+    # 备份旧目录
     if [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ]; then
         BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-upgrade-backup-XXXXXX")"
         cp -a "$EXTENSIONS_DIR/$PLUGIN_ID" "$BACKUP_DIR/$PLUGIN_ID"
-        echo "  已备份旧目录: $BACKUP_DIR"
+        echo "  已备份旧目录"
     fi
 
-    # 清理历史遗留名称（这些不需要回滚）
-    for dir_name in qqbot openclaw-qq; do
-        [ -d "$EXTENSIONS_DIR/$dir_name" ] && rm -rf "$EXTENSIONS_DIR/$dir_name" && echo "  已清理历史目录: $EXTENSIONS_DIR/$dir_name"
+    # 清理历史遗留
+    for d in qqbot openclaw-qq; do
+        [ -d "$EXTENSIONS_DIR/$d" ] && rm -rf "$EXTENSIONS_DIR/$d" && echo "  已清理: $d"
+    done
+    [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID"
+
+    # 多 registry 重试
+    NATIVE_OK=false
+    for registry in "https://registry.npmjs.org/" "https://mirrors.cloud.tencent.com/npm/"; do
+        echo "  尝试 install (registry: $registry)..."
+        ensure_valid_cwd
+        RC=0
+        npm_config_registry="$registry" run_with_timeout "$INSTALL_TIMEOUT" \
+            "plugins install" openclaw plugins install "$INSTALL_SRC" --pin 2>&1 || RC=$?
+        if [ $RC -eq 0 ] && [ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
+            NATIVE_OK=true; echo "  ✅ install 成功"; break
+        fi
+        echo "  ⚠️  失败 (exit=$RC)"
+        [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ ! -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ] && \
+            rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID" 2>/dev/null || true
+        find "${EXTENSIONS_DIR:-/dev/null}" "${TMPDIR:-/tmp}" -maxdepth 1 -name ".openclaw-install-stage-*" \
+            -exec rm -rf {} + 2>/dev/null || true
     done
 
-    # 创建暂存目录用于原子化安装
-    STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/.qqbot-staging-XXXXXX")"
-    STAGING_EXTENSIONS="$STAGING_DIR/extensions"
-    mkdir -p "$STAGING_EXTENSIONS"
-
-    echo "  执行 install: $INSTALL_SRC"
-    echo "  [原子化] 安装到暂存目录: $STAGING_DIR"
-
-    # [优化4] 确保 CWD 有效
-    ensure_valid_cwd
-
-    # 先删除旧的插件目录（openclaw plugins install 需要目标目录不存在）
-    if [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ]; then
-        rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID"
-    fi
-
-    # [优化7] 带超时保护执行 install
-    INSTALL_EXIT_CODE=0
-    run_with_timeout "$INSTALL_TIMEOUT" "plugins install $INSTALL_SRC" $CMD plugins install "$INSTALL_SRC" --pin 2>&1 || INSTALL_EXIT_CODE=$?
-
-    if [ $INSTALL_EXIT_CODE -eq 0 ]; then
-        # install 返回 0，验证插件目录是否真的存在且完整
-        if [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
-            UPGRADE_OK=true
-            INSTALL_COMPLETED=true
-            echo "  ✅ install 成功"
-            # install 成功，清理备份和暂存
-            if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-                rm -rf "$BACKUP_DIR"
-                echo "  已清理旧版备份"
-            fi
-            if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
-                rm -rf "$STAGING_DIR"
-                STAGING_DIR=""
-            fi
-            # 清理 openclaw CLI install 可能留下的额外 backup 目录
-            find "$EXTENSIONS_DIR" -maxdepth 1 -name ".openclaw-qqbot-backup-*" -exec rm -rf {} + 2>/dev/null || true
-            find "${EXTENSIONS_DIR:-/dev/null}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-            find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-            find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-upgrade-backup-*" -exec rm -rf {} + 2>/dev/null || true
-            find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-staging-*" -exec rm -rf {} + 2>/dev/null || true
-        else
-            echo "  ❌ install 命令返回成功但插件目录不完整"
-            echo "  [诊断] 目录存在: $([ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && echo '是' || echo '否')"
-            echo "  [诊断] package.json 存在: $([ -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ] && echo '是' || echo '否')"
-            # 清理可能残留的暂存目录
-            find "${EXTENSIONS_DIR:-/dev/null}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-            find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-            # 回滚（带验证）
-            rollback_plugin_dir "安装后目录不完整"
-            # [优化8] 恢复配置快照（快照已包含完整的安装前配置，无需再调用 restore_qqbot_channel）
-            restore_config_snapshot
-            # 清理临时配置文件（快照已恢复，临时配置不再需要）
-            if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-                rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
-            fi
+    if [ "$NATIVE_OK" = "true" ]; then
+        mark_success
+    else
+        echo "  原生 install 均失败，降级..."
+        npm_pack_fallback && mark_success || {
+            rollback_plugin_dir "安装失败"; restore_config_snapshot
+            [ -n "$TEMP_CONFIG_FILE" ] && rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
             unset OPENCLAW_CONFIG_PATH 2>/dev/null || true
             echo "QQBOT_NEW_VERSION=unknown"
-            echo "QQBOT_REPORT=❌ QQBot 安装异常（目录不完整，已回滚），请重试或手动安装"
+            echo "QQBOT_REPORT=❌ QQBot 安装失败（已回滚），请检查网络"
             exit 1
-        fi
-    else
-        # 区分超时和其他失败
-        if [ $INSTALL_EXIT_CODE -eq 124 ]; then
-            echo "  ⏰ install 超时（${INSTALL_TIMEOUT}s）"
-            FAIL_REASON="安装超时（${INSTALL_TIMEOUT}s）"
-        else
-            echo "  ❌ install 失败 (exit=$INSTALL_EXIT_CODE)"
-            FAIL_REASON="安装失败 (exit=$INSTALL_EXIT_CODE)"
-        fi
-        # 清理可能残留的暂存目录和不完整的安装
-        find "${EXTENSIONS_DIR:-/dev/null}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-        find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".openclaw-install-stage-*" -exec rm -rf {} + 2>/dev/null || true
-        # 超时可能留下不完整的插件目录，清理之
-        if [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && [ ! -f "$EXTENSIONS_DIR/$PLUGIN_ID/package.json" ]; then
-            echo "  [清理] 删除不完整的插件目录"
-            rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID" 2>/dev/null || true
-        fi
-
-        # ============================================================================
-        #  [优化9] npm pack 降级安装 — openclaw ≥ 3.22 时尝试绕过 CLI 直接安装
-        # ============================================================================
-        # 参考飞书的做法：当 openclaw plugins install 失败时，
-        # 如果 openclaw 版本 ≥ 3.22，降级为 npm pack + 手动解压 + 直接部署。
-        # 这种方式绕过了 openclaw CLI 的 plugins install 逻辑（可能有 bug 或兼容性问题），
-        # 直接通过 npm 下载包并手动部署到 extensions 目录。
-        NPM_PACK_FALLBACK_OK=false
-        if [ -n "$OPENCLAW_VERSION" ] && version_gte "$OPENCLAW_VERSION" "2026.3.22"; then
-            echo ""
-            echo "  [降级] openclaw 版本 $OPENCLAW_VERSION ≥ 3.22，尝试 npm pack 降级安装..."
-            if npm_pack_fallback_install; then
-                # 降级安装成功
-                NPM_PACK_FALLBACK_OK=true
-                UPGRADE_OK=true
-                INSTALL_COMPLETED=true
-                echo "  ✅ [降级] npm pack 安装成功"
-                # 清理备份
-                if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-                    rm -rf "$BACKUP_DIR"
-                    echo "  已清理旧版备份"
-                fi
-                if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
-                    rm -rf "$STAGING_DIR"
-                    STAGING_DIR=""
-                fi
-                # 清理残留
-                find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-upgrade-backup-*" -exec rm -rf {} + 2>/dev/null || true
-                find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-staging-*" -exec rm -rf {} + 2>/dev/null || true
-                find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-pack-*" -exec rm -rf {} + 2>/dev/null || true
-                find "${TMPDIR:-/tmp}" -maxdepth 1 -name ".qqbot-extract-*" -exec rm -rf {} + 2>/dev/null || true
-            else
-                echo "  ❌ [降级] npm pack 安装也失败了"
-            fi
-        else
-            if [ -n "$OPENCLAW_VERSION" ]; then
-                echo "  [跳过降级] openclaw 版本 $OPENCLAW_VERSION < 3.22，不支持 npm pack 降级"
-            else
-                echo "  [跳过降级] 无法检测 openclaw 版本，跳过 npm pack 降级"
-            fi
-        fi
-
-        # 如果降级安装也失败，执行回滚
-        if [ "$NPM_PACK_FALLBACK_OK" != "true" ]; then
-            # 回滚：恢复旧目录（带验证）
-            rollback_plugin_dir "$FAIL_REASON"
-            # [优化8] 恢复配置快照（快照已包含完整的安装前配置，无需再调用 restore_qqbot_channel）
-            restore_config_snapshot
-            # 清理临时配置文件（快照已恢复，临时配置不再需要）
-            if [ -n "$TEMP_CONFIG_FILE" ] && [ -f "$TEMP_CONFIG_FILE" ]; then
-                rm -f "$TEMP_CONFIG_FILE" 2>/dev/null || true
-            fi
-            unset OPENCLAW_CONFIG_PATH 2>/dev/null || true
-            if [ $INSTALL_EXIT_CODE -eq 124 ]; then
-                echo "QQBOT_NEW_VERSION=unknown"
-                echo "QQBOT_REPORT=⏰ QQBot 安装超时（${INSTALL_TIMEOUT}s，已回滚），请检查网络或增加 --timeout 参数"
-            else
-                echo "QQBOT_NEW_VERSION=unknown"
-                echo "QQBOT_REPORT=❌ QQBot 安装失败（已回滚到旧版本），请检查网络和 npm registry"
-            fi
-            exit 1
-        fi
+        }
     fi
 fi
 
-# install/update 完成，恢复 channels.qqbot
-# [优化5] 此时插件目录已验证完整，可以安全地同步配置
-restore_qqbot_channel
-
-# [优化8] install 成功，配置快照不再需要（后续操作不需要回滚到安装前）
+sync_temp_config
 cleanup_config_snapshot
+INSTALL_COMPLETED=true
 
-# [2/4] 验证安装
+# ============================================================================
+#  [2/4] 验证安装
+# ============================================================================
 echo ""
 echo "[2/4] 验证安装..."
 
-PKG_JSON="$EXTENSIONS_DIR/$PLUGIN_ID/package.json"
-if [ -f "$PKG_JSON" ]; then
-  NEW_VERSION="$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).version||'')" "$PKG_JSON" 2>/dev/null || true)"
-fi
-
-# Preflight 检查
-PREFLIGHT_OK=true
 TARGET_DIR="$EXTENSIONS_DIR/$PLUGIN_ID"
+NEW_VERSION=""; [ -f "$TARGET_DIR/package.json" ] && NEW_VERSION="$(read_pkg_version "$TARGET_DIR/package.json")"
 
-if [ -z "$NEW_VERSION" ]; then
-    echo "  ❌ 无法读取新版本号"
-    PREFLIGHT_OK=false
-else
-    echo "  ✅ 版本号: $NEW_VERSION"
-fi
+PREFLIGHT_OK=true
+[ -z "$NEW_VERSION" ] && echo "  ❌ 无法读取版本号" && PREFLIGHT_OK=false || echo "  ✅ 版本: $NEW_VERSION"
 
-# 入口文件
-ENTRY_FILE=""
-for candidate in "dist/index.js" "index.js"; do
-    if [ -f "$TARGET_DIR/$candidate" ]; then
-        ENTRY_FILE="$candidate"
-        break
-    fi
-done
-if [ -z "$ENTRY_FILE" ]; then
-    echo "  ❌ 缺少入口文件（dist/index.js 或 index.js）"
-    PREFLIGHT_OK=false
-else
-    echo "  ✅ 入口文件: $ENTRY_FILE"
-fi
+ENTRY=""; for f in "dist/index.js" "index.js"; do [ -f "$TARGET_DIR/$f" ] && ENTRY="$f" && break; done
+[ -z "$ENTRY" ] && echo "  ❌ 缺少入口文件" && PREFLIGHT_OK=false || echo "  ✅ 入口: $ENTRY"
 
-# 核心目录
 if [ -d "$TARGET_DIR/dist/src" ]; then
-    CORE_JS_COUNT=$(find "$TARGET_DIR/dist/src" -name "*.js" -type f 2>/dev/null | wc -l | tr -d ' ')
-    echo "  ✅ dist/src/ 包含 ${CORE_JS_COUNT} 个 JS 文件"
-    if [ "$CORE_JS_COUNT" -lt 5 ]; then
-        echo "  ❌ JS 文件数量异常偏少（预期 ≥ 5，实际 ${CORE_JS_COUNT}）"
-        PREFLIGHT_OK=false
-    fi
+    JS_COUNT=$(find "$TARGET_DIR/dist/src" -name "*.js" -type f 2>/dev/null | wc -l | tr -d ' ')
+    echo "  ✅ dist/src/ 含 ${JS_COUNT} 个 JS"
+    [ "$JS_COUNT" -lt 5 ] && echo "  ❌ JS 数量异常偏少" && PREFLIGHT_OK=false
 else
-    echo "  ❌ 缺少核心目录 dist/src/"
-    PREFLIGHT_OK=false
+    echo "  ❌ 缺少 dist/src/"; PREFLIGHT_OK=false
 fi
 
-# 关键模块
-MISSING_MODULES=""
-for module in "dist/src/gateway.js" "dist/src/api.js" "dist/src/admin-resolver.js"; do
-    if [ ! -f "$TARGET_DIR/$module" ]; then
-        MISSING_MODULES="$MISSING_MODULES $module"
-    fi
+MISS=""
+for m in "dist/src/gateway.js" "dist/src/api.js" "dist/src/admin-resolver.js"; do
+    [ ! -f "$TARGET_DIR/$m" ] && MISS="$MISS $m"
 done
-if [ -n "$MISSING_MODULES" ]; then
-    echo "  ❌ 缺少关键模块:$MISSING_MODULES"
-    PREFLIGHT_OK=false
-else
-    echo "  ✅ 关键模块完整"
-fi
+[ -n "$MISS" ] && echo "  ❌ 缺少:$MISS" && PREFLIGHT_OK=false || echo "  ✅ 关键模块完整"
 
-# bundled 依赖
 if [ -d "$TARGET_DIR/node_modules" ]; then
-    BUNDLED_OK=true
-    for dep in "ws" "silk-wasm"; do
-        if [ ! -d "$TARGET_DIR/node_modules/$dep" ]; then
-            echo "  ⚠️  bundled 依赖缺失: $dep"
-            BUNDLED_OK=false
-        fi
-    done
-    if $BUNDLED_OK; then
-        echo "  ✅ 核心 bundled 依赖完整"
-    fi
+    BOK=true
+    for dep in ws silk-wasm; do [ ! -d "$TARGET_DIR/node_modules/$dep" ] && echo "  ⚠️  缺失: $dep" && BOK=false; done
+    $BOK && echo "  ✅ bundled 依赖完整"
 fi
 
 if [ "$PREFLIGHT_OK" != "true" ]; then
-    echo ""
-    echo "❌ 验证未通过"
-    echo "QQBOT_NEW_VERSION=unknown"
-    echo "QQBOT_REPORT=⚠️ QQBot 升级异常，验证未通过"
+    echo ""; echo "❌ 验证未通过"
+    echo "QQBOT_NEW_VERSION=unknown"; echo "QQBOT_REPORT=⚠️ 验证未通过"
     exit 1
 fi
 echo "  ✅ 验证全部通过"
 
-# ── 安装后健康检查：openclaw doctor ──
-# 在 preflight 通过后，调用 openclaw doctor 从框架层面验证插件是否能被正确加载
-# （配置完整性、依赖关系、SDK 链接等），比脚本自身的 preflight 检查更全面。
+# 轻量健康检查
 echo ""
-echo "  [健康检查] 执行 openclaw doctor..."
+echo "  [健康检查] 确认插件注册..."
 ensure_valid_cwd
-DOCTOR_OUTPUT=""
-DOCTOR_RC=0
-DOCTOR_OUTPUT=$(run_with_timeout 60 "doctor 健康检查" $CMD doctor 2>&1) || DOCTOR_RC=$?
-if [ $DOCTOR_RC -eq 0 ]; then
-    echo "  ✅ doctor 健康检查通过"
-else
-    # doctor 检查不通过不阻塞升级流程，仅输出警告
-    echo "  ⚠️  doctor 健康检查发现问题 (exit=$DOCTOR_RC):"
-    echo "$DOCTOR_OUTPUT" | head -20 | sed 's/^/    /'
-    echo "  提示: 可稍后手动执行 '$CMD doctor --fix' 尝试自动修复"
-fi
+PLIST="$(run_with_timeout 10 "plugins list" openclaw plugins list 2>&1 || true)"
+echo "$PLIST" | grep -q "$PLUGIN_ID" && echo "  ✅ 插件已注册" || \
+    echo "  ⚠️  未在 plugins list 中找到（非致命，重启后可能自动修复）"
 
-# 确保 openclaw/plugin-sdk 可解析：
-# openclaw plugins install 不会执行 npm lifecycle scripts，
-# 需要手动调用 postinstall-link-sdk.js 创建 node_modules/openclaw → 全局 openclaw 的符号链接
-POSTINSTALL_SCRIPT="$TARGET_DIR/scripts/postinstall-link-sdk.js"
-if [ -f "$POSTINSTALL_SCRIPT" ]; then
+# postinstall SDK link（原生 install 路径已由 openclaw 处理，npm pack 降级路径已在函数内处理，
+#   这里再执行一次确保覆盖 update 路径——update 不会执行 lifecycle scripts）
+if [ -f "$TARGET_DIR/scripts/postinstall-link-sdk.js" ]; then
     echo "  执行 postinstall-link-sdk..."
-    # [优化4] 确保 CWD 有效
     ensure_valid_cwd
-    if node "$POSTINSTALL_SCRIPT" 2>&1; then
-        echo "  ✅ plugin-sdk 链接就绪"
-    else
-        echo "  ⚠️  postinstall-link-sdk 失败（symlink 未创建），插件可能无法加载"
-        echo "  提示: 如果 openclaw 是通过 pnpm 安装的，请确保 pnpm 命令可用"
-    fi
+    node "$TARGET_DIR/scripts/postinstall-link-sdk.js" 2>&1 && echo "  ✅ SDK 链接就绪" || \
+        echo "  ⚠️  postinstall-link-sdk 失败（非致命）"
 fi
 
-# [3/4] 输出结构化信息（供 TS handler 解析）
+# ============================================================================
+#  [3/4] 升级结果
+# ============================================================================
 echo ""
 echo "[3/4] 升级结果..."
 echo "QQBOT_NEW_VERSION=${NEW_VERSION:-unknown}"
-
-if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "unknown" ]; then
-    echo "QQBOT_REPORT=✅ QQBot 升级完成: v${NEW_VERSION}"
-else
-    echo "QQBOT_REPORT=⚠️ QQBot 升级异常，无法确认新版本"
-fi
+[ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "unknown" ] && \
+    echo "QQBOT_REPORT=✅ QQBot 升级完成: v${NEW_VERSION}" || \
+    echo "QQBOT_REPORT=⚠️ 无法确认新版本"
 
 echo ""
 echo "==========================================="
 echo "  ✅ 安装完成"
 echo "==========================================="
 
-# --no-restart 模式（热更新场景）：立即退出，让调用方触发 gateway restart
-if [ "$NO_RESTART" = "true" ]; then
-    echo ""
-    echo "[跳过重启] --no-restart 已指定，脚本立即退出以便调用方触发 gateway restart"
-    exit 0
-fi
+[ "$NO_RESTART" = "true" ] && echo "" && echo "[跳过重启] --no-restart 已指定" && exit 0
 
-# 以下步骤仅在非热更新（手动执行）场景中执行
-
-# [配置] appid/secret（仅在提供了参数时执行）
+# ============================================================================
+#  [配置] appid/secret
+# ============================================================================
 if [ -n "$APPID" ] && [ -n "$SECRET" ]; then
     echo ""
     echo "[配置] 写入 qqbot 通道配置..."
-    DESIRED_TOKEN="${APPID}:${SECRET}"
+    DESIRED="${APPID}:${SECRET}"
+    CURRENT=""
+    [ -f "$CONFIG_FILE" ] && CURRENT=$(node -e "
+        try {
+            const cfg = JSON.parse(require('fs').readFileSync('$CONFIG_FILE', 'utf8'));
+            for (const k of ['qqbot','openclaw-qqbot','openclaw-qq']) {
+                const ch = cfg.channels?.[k]; if (!ch) continue;
+                if (ch.token) { process.stdout.write(ch.token); break; }
+                if (ch.appId && ch.clientSecret) { process.stdout.write(ch.appId+':'+ch.clientSecret); break; }
+            }
+        } catch {}
+    " 2>/dev/null || true)
 
-    # 读取当前已有的 token
-    CURRENT_TOKEN=""
-    for _app in openclaw clawdbot moltbot; do
-        _cfg="$HOME/.$_app/$_app.json"
-        if [ -f "$_cfg" ]; then
-            CURRENT_TOKEN=$(node -e "
-                const cfg = JSON.parse(require('fs').readFileSync('$_cfg', 'utf8'));
-                const keys = ['qqbot', 'openclaw-qqbot', 'openclaw-qq'];
-                for (const key of keys) {
-                    const ch = cfg.channels && cfg.channels[key];
-                    if (!ch) continue;
-                    if (ch.token) { process.stdout.write(ch.token); process.exit(0); }
-                    if (ch.appId && ch.clientSecret) { process.stdout.write(ch.appId + ':' + ch.clientSecret); process.exit(0); }
-                }
-            " 2>/dev/null || true)
-            [ -n "$CURRENT_TOKEN" ] && break
-        fi
-    done
-
-    if [ "$CURRENT_TOKEN" = "$DESIRED_TOKEN" ]; then
-        echo "  ✅ 当前配置已是目标值，跳过写入"
+    if [ "$CURRENT" = "$DESIRED" ]; then
+        echo "  ✅ 配置已是目标值"
+    elif [ -f "$CONFIG_FILE" ] && node -e "
+        const fs = require('fs'), cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
+        (cfg.channels ??= {}).qqbot = { ...cfg.channels.qqbot, appId: '$APPID', clientSecret: '$SECRET' };
+        fs.writeFileSync('$CONFIG_FILE', JSON.stringify(cfg, null, 4) + '\n');
+    " 2>&1; then
+        echo "  ✅ 通道配置写入成功"
     else
-        # qqbot 是插件自定义通道，openclaw channels add --channel 不支持，
-        # 直接编辑配置文件写入 channels.qqbot
-        CONFIG_FILE="$HOME/.$CMD/$CMD.json"
-        if [ -f "$CONFIG_FILE" ] && node -e "
-            const fs = require('fs');
-            const cfg = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
-            if (!cfg.channels) cfg.channels = {};
-            if (!cfg.channels.qqbot) cfg.channels.qqbot = {};
-            cfg.channels.qqbot.appId = '$APPID';
-            cfg.channels.qqbot.clientSecret = '$SECRET';
-            fs.writeFileSync('$CONFIG_FILE', JSON.stringify(cfg, null, 4) + '\n');
-        " 2>&1; then
-            echo "  ✅ 通道配置写入成功"
-        else
-            echo "  ❌ 配置写入失败，请手动编辑 $CONFIG_FILE 添加 channels.qqbot:"
-            echo "     { \"channels\": { \"qqbot\": { \"appId\": \"$APPID\", \"clientSecret\": \"...\" } } }"
-        fi
+        echo "  ❌ 写入失败，请手动编辑 $CONFIG_FILE"
     fi
 elif [ -n "$APPID" ] || [ -n "$SECRET" ]; then
-    echo ""
-    echo "⚠️  --appid 和 --secret 必须同时提供"
+    echo ""; echo "⚠️  --appid 和 --secret 必须同时提供"
 fi
 
-# [4/4] 重启 gateway 使新版本生效
+# ============================================================================
+#  [4/4] 重启 gateway
+# ============================================================================
 echo ""
 
-# 手动升级场景：提前写入 startup-marker，阻止重启后 bot 重复推送升级通知
+# startup-marker 防重复通知
 if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "unknown" ]; then
-    MARKER_DIR="$HOME/.openclaw/qqbot/data"
-    mkdir -p "$MARKER_DIR"
-    MARKER_FILE="$MARKER_DIR/startup-marker.json"
+    MARKER_DIR="$OPENCLAW_HOME/qqbot/data"; mkdir -p "$MARKER_DIR"
     NOW="$(date -u +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date +%Y-%m-%dT%H:%M:%SZ)"
-    echo "{\"version\":\"$NEW_VERSION\",\"startedAt\":\"$NOW\",\"greetedAt\":\"$NOW\"}" > "$MARKER_FILE"
+    echo "{\"version\":\"$NEW_VERSION\",\"startedAt\":\"$NOW\",\"greetedAt\":\"$NOW\"}" > "$MARKER_DIR/startup-marker.json"
 fi
 
-echo "[重启] 重启 gateway 使新版本生效..."
-# [优化4] 确保 CWD 有效
+echo "[重启] 重启 gateway..."
 ensure_valid_cwd
-GATEWAY_RESTART_RC=0
-run_with_timeout 90 "gateway restart" $CMD gateway restart 2>&1 || GATEWAY_RESTART_RC=$?
-if [ $GATEWAY_RESTART_RC -eq 0 ]; then
+GW_RC=0; run_with_timeout 90 "gateway restart" openclaw gateway restart 2>&1 || GW_RC=$?
+
+if [ $GW_RC -eq 0 ]; then
     echo "  ✅ gateway 已重启"
-    echo ""
-    if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "unknown" ]; then
-        echo "🎉 QQBot 插件已更新至 v${NEW_VERSION}，在线等候你的吩咐。"
-    fi
+    [ -n "$NEW_VERSION" ] && echo "" && echo "🎉 QQBot 插件已更新至 v${NEW_VERSION}，在线等候你的吩咐。"
 else
-    if [ $GATEWAY_RESTART_RC -eq 124 ]; then
-        echo "  ⏰ gateway restart 超时（90s）"
-    fi
-    echo "  ⚠️  gateway 重启失败，尝试 openclaw doctor --fix 自动修复..."
+    [ $GW_RC -eq 124 ] && echo "  ⏰ gateway restart 超时"
+    echo "  ⚠️  重启失败，尝试 doctor --fix..."
     ensure_valid_cwd
 
-    # [风险5修复] doctor --fix 前保存配置快照，防止 doctor 意外删除/修改关键配置
-    _pre_doctor_config=""
-    if [ -f "$CONFIG_FILE" ]; then
-        _pre_doctor_config="$(mktemp "${TMPDIR:-/tmp}/.qqbot-pre-doctor-XXXXXX")"
-        cp -a "$CONFIG_FILE" "$_pre_doctor_config"
-    fi
+    _bak=""; [ -f "$CONFIG_FILE" ] && _bak="$(mktemp "${TMPDIR:-/tmp}/.qqbot-pre-doctor-XXXXXX")" && cp -a "$CONFIG_FILE" "$_bak"
+    run_with_timeout 30 "doctor --fix" openclaw doctor --fix 2>&1 | head -20 | sed 's/^/    /' || true
 
-    _doctor_fix_output=$(run_with_timeout 120 "doctor --fix 自动修复" $CMD doctor --fix 2>&1) || true
-    echo "$_doctor_fix_output" | head -30 | sed 's/^/    /'
-
-    # [风险5修复] doctor --fix 后验证关键配置项是否被意外删除
-    if [ -n "$_pre_doctor_config" ] && [ -f "$_pre_doctor_config" ] && [ -f "$CONFIG_FILE" ]; then
-        _config_damaged=false
-        _config_damaged=$(node -e "
+    if [ -n "$_bak" ] && [ -f "$_bak" ] && [ -f "$CONFIG_FILE" ]; then
+        _damaged=$(node -e "
           try {
             const fs = require('fs');
-            const before = JSON.parse(fs.readFileSync('$_pre_doctor_config', 'utf8'));
-            const after = JSON.parse(fs.readFileSync('$CONFIG_FILE', 'utf8'));
-            // 检查 channels.qqbot 是否被删除
-            if (before.channels?.qqbot && !after.channels?.qqbot) {
-              process.stdout.write('channels.qqbot');
-            }
-            // 检查 plugins.installs 中的 qqbot 记录是否被删除
-            else if (before.plugins?.installs?.['$PLUGIN_ID'] && !after.plugins?.installs?.['$PLUGIN_ID']) {
-              process.stdout.write('plugins.installs');
-            }
-            // 检查 plugins.entries 中的 qqbot 记录是否被删除
-            else if (before.plugins?.entries?.['$PLUGIN_ID'] && !after.plugins?.entries?.['$PLUGIN_ID']) {
-              process.stdout.write('plugins.entries');
-            }
+            const b = JSON.parse(fs.readFileSync('$_bak','utf8')), a = JSON.parse(fs.readFileSync('$CONFIG_FILE','utf8'));
+            if (b.channels?.qqbot && !a.channels?.qqbot) process.stdout.write('channels.qqbot');
+            else if (b.plugins?.installs?.['$PLUGIN_ID'] && !a.plugins?.installs?.['$PLUGIN_ID']) process.stdout.write('installs');
+            else if (b.plugins?.entries?.['$PLUGIN_ID'] && !a.plugins?.entries?.['$PLUGIN_ID']) process.stdout.write('entries');
           } catch {}
         " 2>/dev/null || true)
-        if [ -n "$_config_damaged" ]; then
-            echo "  ⚠️  [配置保护] doctor --fix 删除了关键配置项: $_config_damaged，正在恢复..."
-            cp -a "$_pre_doctor_config" "$CONFIG_FILE"
-            echo "  ✅ [配置保护] 已恢复 doctor --fix 前的配置"
-        fi
-        rm -f "$_pre_doctor_config" 2>/dev/null || true
+        [ -n "$_damaged" ] && echo "  ⚠️  doctor 误删 $_damaged，恢复中..." && cp -a "$_bak" "$CONFIG_FILE" && echo "  ✅ 已恢复"
+        rm -f "$_bak" 2>/dev/null || true
     fi
 
-    echo ""
-    echo "  [修复后重试] 重新执行 gateway restart..."
+    echo ""; echo "  [重试] gateway restart..."
     ensure_valid_cwd
-    RETRY_RESTART_RC=0
-    run_with_timeout 90 "gateway restart (重试)" $CMD gateway restart 2>&1 || RETRY_RESTART_RC=$?
-    if [ $RETRY_RESTART_RC -eq 0 ]; then
-        echo "  ✅ doctor --fix 后 gateway 重启成功"
-        echo ""
-        if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "unknown" ]; then
-            echo "🎉 QQBot 插件已更新至 v${NEW_VERSION}，在线等候你的吩咐。"
-        fi
+    RR=0; run_with_timeout 90 "gateway restart (重试)" openclaw gateway restart 2>&1 || RR=$?
+    if [ $RR -eq 0 ]; then
+        echo "  ✅ 重启成功"
+        [ -n "$NEW_VERSION" ] && echo "" && echo "🎉 QQBot 插件已更新至 v${NEW_VERSION}，在线等候你的吩咐。"
     else
-        if [ $RETRY_RESTART_RC -eq 124 ]; then
-            echo "  ⏰ 重试 gateway restart 超时（90s）"
-        fi
-        echo "  ❌ 仍然无法重启，请手动排查:"
-        echo "    $CMD doctor"
-        echo "    $CMD gateway restart"
-        echo "    tail -f /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log"
+        echo "  ❌ 仍无法重启，请手动排查:"
+        echo "    openclaw doctor && openclaw gateway restart"
     fi
 fi

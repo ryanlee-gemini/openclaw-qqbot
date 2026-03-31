@@ -2,8 +2,7 @@
 
 # qqbot 通过 npm pack 直接安装（独立验证脚本）
 #
-# 参考飞书（npx @larksuite/openclaw-lark-tools update）、微信、企微的做法，
-# 通过 npm pack + 手动部署 安装插件，绕过 openclaw CLI 的 plugins install/update 逻辑。
+# 通过 npm pack + 手动部署安装插件，绕过 openclaw CLI 的 plugins install/update 逻辑。
 #
 # 流程：
 #   1. npm pack <pkg> 下载 tgz（多 registry 兜底）
@@ -108,10 +107,11 @@ run_with_timeout() {
         fi
     ) &
     local watchdog_pid=$!
+    disown "$watchdog_pid" 2>/dev/null || true
     wait "$cmd_pid" 2>/dev/null
     local rc=$?
-    kill "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null 2>&1
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null 2>&1 || true
     if [ $rc -eq 143 ] || [ $rc -eq 137 ]; then
         return 124
     fi
@@ -179,13 +179,13 @@ fi
 
 # 检测 CLI
 CMD=""
-for name in openclaw clawdbot moltbot; do
-    command -v "$name" &>/dev/null && CMD="$name" && break
-done
-[ -z "$CMD" ] && echo "❌ 未找到 openclaw / clawdbot / moltbot" && exit 1
+command -v openclaw &>/dev/null && CMD="openclaw"
+[ -z "$CMD" ] && echo "❌ 未找到 openclaw" && exit 1
 
-EXTENSIONS_DIR="$HOME/.$CMD/extensions"
-CONFIG_FILE="$HOME/.$CMD/$CMD.json"
+# 解析 openclaw 数据目录（支持 OPENCLAW_STATE_DIR 环境变量覆盖，如腾讯云 /tmp/openclaw）
+OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+EXTENSIONS_DIR="$OPENCLAW_HOME/extensions"
+CONFIG_FILE="$OPENCLAW_HOME/openclaw.json"
 
 # 检测 openclaw 版本
 OPENCLAW_VERSION="$($CMD --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
