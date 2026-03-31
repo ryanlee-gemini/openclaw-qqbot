@@ -527,6 +527,23 @@ if [ "$UPGRADE_OK" != "true" ]; then
     done
     [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID"
 
+    # 从配置中移除插件记录，防止 openclaw CLI 启动时自动发现旧插件并报 "already exists"
+    local _install_cfg="${TEMP_CONFIG_FILE:-$CONFIG_FILE}"
+    [ -f "$_install_cfg" ] && node -e "
+      try {
+        const fs = require('fs');
+        const cfg = JSON.parse(fs.readFileSync('$_install_cfg', 'utf8'));
+        let c = false;
+        if (cfg.plugins?.installs?.['$PLUGIN_ID']) { delete cfg.plugins.installs['$PLUGIN_ID']; c = true; }
+        if (cfg.plugins?.entries?.['$PLUGIN_ID']) { delete cfg.plugins.entries['$PLUGIN_ID']; c = true; }
+        if (Array.isArray(cfg.plugins?.allow)) {
+          const i = cfg.plugins.allow.indexOf('$PLUGIN_ID');
+          if (i >= 0) { cfg.plugins.allow.splice(i, 1); c = true; }
+        }
+        if (c) fs.writeFileSync('$_install_cfg', JSON.stringify(cfg, null, 4) + '\n');
+      } catch {}
+    " 2>/dev/null || true
+
     # 多 registry 重试
     NATIVE_OK=false
     for registry in "https://registry.npmjs.org/" "https://mirrors.cloud.tencent.com/npm/"; do
