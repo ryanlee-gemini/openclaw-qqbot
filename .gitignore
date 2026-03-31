@@ -9,3 +9,9 @@ openclaw.json
 *.tgz
 *.log
 pnpm-lock.yaml
+
+# 临时分析文件
+1 (1).txt
+1 (2).txt
+console-vs-openclaw-analysis.txt
+docs/comparison/
