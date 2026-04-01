@@ -528,7 +528,7 @@ if [ "$UPGRADE_OK" != "true" ]; then
     [ -d "$EXTENSIONS_DIR/$PLUGIN_ID" ] && rm -rf "$EXTENSIONS_DIR/$PLUGIN_ID"
 
     # 从配置中移除插件记录，防止 openclaw CLI 启动时自动发现旧插件并报 "already exists"
-    local _install_cfg="${TEMP_CONFIG_FILE:-$CONFIG_FILE}"
+    _install_cfg="${TEMP_CONFIG_FILE:-$CONFIG_FILE}"
     [ -f "$_install_cfg" ] && node -e "
       try {
         const fs = require('fs');
